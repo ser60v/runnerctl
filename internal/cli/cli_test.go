@@ -1,0 +1,440 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"go.yaml.in/yaml/v3"
+)
+
+const testOrg = "11111111-1111-4111-8111-111111111111"
+const testProject = "22222222-2222-4222-8222-222222222222"
+const testPool = "33333333-3333-4333-8333-333333333333"
+const testToken = "rp_pat_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+
+func setup(t *testing.T) {
+	t.Helper()
+	t.Setenv("RUNNERCTL_CONFIG_DIR", filepath.Join(t.TempDir(), "private-config"))
+	t.Setenv("RUNNERCTL_TOKEN", "")
+}
+func reply(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+func identityResponse() any {
+	return map[string]any{"token_id": testPool, "organization": map[string]string{"id": testOrg, "name": "Test"}, "projects": []map[string]string{{"id": testProject, "name": "Demo"}}, "scopes": knownScopes}
+}
+func example() manifest {
+	enabled := true
+	m := manifest{APIVersion: "runner.ser60v.com/v1", Kind: "Pool", Context: "default", Spec: poolSpec{Name: "linux-ci", Environment: "ubuntu-latest", CPU: 2000, Memory: 8192, Disk: 41088, MaxJobMinutes: 60, MaxRunners: 3, Enabled: &enabled}}
+	m.Metadata.ID = testPool
+	m.Metadata.OrganizationID = testOrg
+	m.Metadata.ProjectID = testProject
+	return m
+}
+func manifestFile(t *testing.T, text string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pool.yaml")
+	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestStrictManifestRejectsAmbiguityAndExecutableConfiguration(t *testing.T) {
+	b, _ := yaml.Marshal(example())
+	good := string(b)
+	if _, err := readManifest(manifestFile(t, good)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readManifest(manifestFile(t, strings.Replace(good, `site_id: ""`, "site_id: desktop-i9", 1))); err != nil {
+		t.Fatal("valid named site rejected", err)
+	}
+	for name, text := range map[string]string{
+		"duplicate":       good + "kind: Other\n",
+		"unknown":         good + "token: some-secret\n",
+		"documents":       good + "---\n" + good,
+		"alias":           strings.Replace(good, "name: linux-ci", "name: &name linux-ci", 1),
+		"merge":           strings.Replace(good, "spec:", "spec:\n    <<: {name: evil}", 1),
+		"tag":             strings.Replace(good, "name: linux-ci", "name: !exec evil", 1),
+		"missing_enabled": strings.Replace(good, "    enabled: true\n", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := readManifest(manifestFile(t, text)); err == nil {
+				t.Fatal("unsafe manifest accepted")
+			}
+		})
+	}
+	// Text is data: the CLI never runs shells or expands commands from a manifest.
+	literal := strings.Replace(good, "name: linux-ci", `name: '$(touch /tmp/should-not-exist)'`, 1)
+	m, err := readManifest(manifestFile(t, literal))
+	if err != nil || m.Spec.Name != "$(touch /tmp/should-not-exist)" {
+		t.Fatal("literal configuration was not preserved", err)
+	}
+}
+
+func TestCredentialsPrivateAndOriginBound(t *testing.T) {
+	setup(t)
+	if err := saveCredential("default", credential{"https://one.example", testToken}); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := credentialPath("default")
+	info, _ := os.Stat(path)
+	if info.Mode().Perm() != 0600 {
+		t.Fatal("credential is not private")
+	}
+	a := New(nil, io.Discard, io.Discard, "test")
+	a.server = "https://two.example"
+	if _, err := a.client(); err == nil {
+		t.Fatal("token sent to a different origin")
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCredential("default"); err == nil {
+		t.Fatal("world-readable credential accepted")
+	}
+	_ = os.Remove(path)
+	target := filepath.Join(t.TempDir(), "outside")
+	_ = os.WriteFile(target, []byte(`{}`), 0600)
+	_ = os.Symlink(target, path)
+	if _, err := loadCredential("default"); err == nil {
+		t.Fatal("credential symlink accepted")
+	}
+	for _, raw := range []string{"http://example.com", "https://user:password@example.com", "https://example.com/path", "https://example.com?token=x", "https://example.com/#fragment"} {
+		if _, err := canonicalServer(raw); err == nil {
+			t.Fatalf("accepted unsafe origin %s", raw)
+		}
+	}
+}
+
+func TestNoRedirectCredentialLeakAndErrorRedaction(t *testing.T) {
+	calls := 0
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; reply(w, map[string]bool{"ok": true}) }))
+	defer foreign.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	if _, err := newClient(srv.URL, testToken).json(context.Background(), "GET", "/api/app/v1/pools", nil); err == nil {
+		t.Fatal("redirect accepted")
+	}
+	if calls != 0 {
+		t.Fatal("redirect followed")
+	}
+	leak := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		reply(w, map[string]any{"error": map[string]string{"code": "bad", "message": testToken + " synthetic-password"}})
+	}))
+	defer leak.Close()
+	c := newClient(leak.URL, testToken)
+	c.secrets = []string{"synthetic-password"}
+	_, err := c.json(context.Background(), "GET", "/api/app/v1/pools", nil)
+	if err == nil || strings.Contains(err.Error(), testToken) || strings.Contains(err.Error(), "synthetic-password") {
+		t.Fatal("secret leaked", err)
+	}
+}
+
+func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
+	for _, action := range []string{"create", "update", "none", "conflict"} {
+		t.Run(action, func(t *testing.T) {
+			setup(t)
+			writes := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer "+testToken {
+					t.Error("missing token")
+				}
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/cli/context"):
+					reply(w, identityResponse())
+				case strings.HasSuffix(r.URL.Path, "/plan"):
+					revision := int64(4)
+					planAction := action
+					if action == "create" {
+						revision = 0
+					}
+					if action == "conflict" {
+						planAction = "update"
+					}
+					reply(w, map[string]any{"pool_id": testPool, "revision": revision, "action": planAction, "errors": []any{}})
+				case r.Method == "PUT":
+					writes++
+					if action == "create" {
+						if r.Header.Get("If-None-Match") != "*" {
+							t.Error("missing create precondition")
+						}
+					} else if r.Header.Get("If-Match") != `"4"` {
+						t.Error("missing revision precondition")
+					}
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if body["project_id"] != testProject || body["max_runners"] != float64(3) {
+						t.Error("wrong desired pool", body)
+					}
+					if action == "conflict" {
+						w.WriteHeader(412)
+						reply(w, map[string]any{"error": map[string]string{"code": "precondition_failed", "message": "changed"}})
+					} else {
+						reply(w, map[string]any{"id": testPool, "revision": 5})
+					}
+				default:
+					t.Error("unexpected request", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := yaml.Marshal(example())
+			path := manifestFile(t, string(data))
+			var out, errout bytes.Buffer
+			a := New(nil, &out, &errout, "test")
+			exit := a.Run(context.Background(), []string{"--json", "apply", "-f", path})
+			want := 0
+			if action == "conflict" {
+				want = 3
+			}
+			if exit != want {
+				t.Fatalf("exit=%d, %s", exit, errout.String())
+			}
+			wantWrites := 1
+			if action == "none" {
+				wantWrites = 0
+			}
+			if writes != wantWrites {
+				t.Fatal("unexpected mutation count", writes)
+			}
+			if strings.Contains(out.String()+errout.String(), testToken) {
+				t.Fatal("token leaked")
+			}
+		})
+	}
+}
+
+func TestManifestCannotChangeOrganization(t *testing.T) {
+	setup(t)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; reply(w, identityResponse()) }))
+	defer srv.Close()
+	_ = saveCredential("default", credential{srv.URL, testToken})
+	m := example()
+	m.Metadata.OrganizationID = testPool
+	b, _ := yaml.Marshal(m)
+	a := New(nil, io.Discard, io.Discard, "test")
+	if exit := a.Run(context.Background(), []string{"apply", "-f", manifestFile(t, string(b))}); exit == 0 {
+		t.Fatal("foreign org accepted")
+	}
+	if calls != 1 {
+		t.Fatal("wrote before organization verification")
+	}
+}
+
+func TestManifestCannotSwitchContextOrRedirectEnvironmentToken(t *testing.T) {
+	setup(t)
+	foreignCalls := 0
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignCalls++; reply(w, identityResponse()) }))
+	defer foreign.Close()
+	if err := saveCredential("other", credential{foreign.URL, testToken}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RUNNERCTL_TOKEN", testToken)
+	a := New(nil, io.Discard, io.Discard, "test")
+	a.context = "other"
+	c, err := a.client()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.server != defaultServer {
+		t.Fatal("environment token inherited origin from stored context")
+	}
+	m := example()
+	m.Context = "other"
+	b, _ := yaml.Marshal(m)
+	path := manifestFile(t, string(b))
+	for _, args := range [][]string{{"apply", "-f", path}, {"--context", "default", "apply", "-f", path}} {
+		a = New(nil, io.Discard, io.Discard, "test")
+		if exit := a.Run(context.Background(), args); exit != 2 {
+			t.Fatal("manifest switched selected context", exit)
+		}
+	}
+	if foreignCalls != 0 {
+		t.Fatal("token was sent before context verification")
+	}
+}
+
+func TestWatchTerminalCancelledNDJSONAndBoundedTimeout(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, "{\n\"status\": \"cancelled\", \"duration_seconds\": 560\n}")
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	a := New(nil, &out, io.Discard, "test")
+	a.json = true
+	err := a.watch(context.Background(), newClient(srv.URL, testToken), testPool, time.Second)
+	ce, ok := err.(*commandError)
+	if !ok || ce.exit != 4 || calls != 1 {
+		t.Fatal("cancelled did not terminate", err, calls)
+	}
+	if strings.Count(out.String(), "\n") != 1 {
+		t.Fatal("not NDJSON")
+	}
+	wait := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(429)
+		reply(w, map[string]any{"error": map[string]string{"code": "rate_limited"}})
+	}))
+	defer wait.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := a.watch(ctx, newClient(wait.URL, testToken), testPool, time.Second); err != context.DeadlineExceeded {
+		t.Fatal("timeout lost", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("retry ignored context")
+	}
+	for seconds, want := range map[float64]string{0: "0s", 59: "59s", 60: "1m 0s", 560: "9m 20s", 3661: "1h 1m 1s"} {
+		if got := duration(seconds); got != want {
+			t.Errorf("%v: %s", seconds, got)
+		}
+	}
+}
+
+func TestInteractiveLoginUsesCSRFBoundProofAndOnlyPersistsPAT(t *testing.T) {
+	for _, twoFA := range []bool{false, true} {
+		t.Run(fmt.Sprint(twoFA), func(t *testing.T) {
+			setup(t)
+			var boundHash string
+			logout := false
+			confirmationCalls := 0
+			loginVerified := false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "GET" && r.Header.Get("X-CSRF-Token") != "csrf-secret" {
+					t.Error("CSRF missing")
+				}
+				switch r.URL.Path {
+				case "/api/auth/v1/auth/csrf":
+					http.SetCookie(w, &http.Cookie{Name: "csrf", Value: "csrf-secret", Path: "/"})
+					reply(w, map[string]string{"csrf_token": "csrf-secret"})
+				case "/api/auth/v1/auth/login":
+					if twoFA {
+						http.SetCookie(w, &http.Cookie{Name: "nonce", Value: "login-nonce", Path: "/"})
+						w.WriteHeader(202)
+						reply(w, map[string]string{"challenge_id": "login-challenge"})
+					} else {
+						http.SetCookie(w, &http.Cookie{Name: "session", Value: "session-secret", Path: "/"})
+						reply(w, map[string]bool{"ok": true})
+					}
+				case "/api/auth/v1/auth/login/verify":
+					if _, err := r.Cookie("nonce"); err != nil {
+						t.Error("missing nonce")
+					}
+					loginVerified = true
+					http.SetCookie(w, &http.Cookie{Name: "session", Value: "session-secret", Path: "/"})
+					reply(w, map[string]bool{"ok": true})
+				case "/api/app/v1/projects":
+					reply(w, map[string]any{"items": []map[string]string{{"id": testProject}}})
+				case "/api/auth/v1/me/security":
+					reply(w, map[string]bool{"email_two_factor_enabled": twoFA})
+				case "/api/auth/v1/auth/reauthenticate":
+					var proof map[string]string
+					_ = json.NewDecoder(r.Body).Decode(&proof)
+					boundHash = proof["body_sha256"]
+					if proof["path"] != "/api/auth/v1/me/personal-tokens" || proof["organization_id"] != testOrg || proof["method"] != "POST" {
+						t.Error("unbound confirmation", proof)
+					}
+					confirmationCalls++
+					if twoFA && confirmationCalls == 1 {
+						if proof["password"] != "" {
+							t.Error("password used instead of 2FA")
+						}
+						w.WriteHeader(202)
+						reply(w, map[string]string{"challenge_id": "confirmation"})
+					} else {
+						if twoFA && proof["code"] != "123456" {
+							t.Error("confirmation code absent")
+						}
+						reply(w, map[string]string{"token": "proof-secret"})
+					}
+				case "/api/auth/v1/me/personal-tokens":
+					b, _ := io.ReadAll(r.Body)
+					sum := sha256.Sum256(b)
+					if hex.EncodeToString(sum[:]) != boundHash || r.Header.Get("X-Operation-Token") != "proof-secret" {
+						t.Error("body/proof mismatch")
+					}
+					if _, err := r.Cookie("session"); err != nil {
+						t.Error("missing session")
+					}
+					w.WriteHeader(201)
+					reply(w, map[string]any{"token": testToken, "personal_token": map[string]string{"id": testPool}})
+				case "/api/app/v1/cli/context":
+					if r.Header.Get("Cookie") != "" || r.Header.Get("Authorization") != "Bearer "+testToken {
+						t.Error("PAT mixed with cookie")
+					}
+					reply(w, identityResponse())
+				case "/api/auth/v1/auth/logout":
+					logout = true
+					w.WriteHeader(204)
+				default:
+					t.Error("unexpected route", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			var out, errout bytes.Buffer
+			a := New(nil, &out, &errout, "test")
+			a.prompt = func(label string, secret bool) (string, error) {
+				if strings.Contains(label, "Password") {
+					return "password-secret", nil
+				}
+				if strings.Contains(label, "Project numbers") {
+					return "1", nil
+				}
+				return "123456", nil
+			}
+			args := []string{"--server", srv.URL, "--json", "auth", "login", "--email", "test@example.test", "--organization", testOrg}
+			if !twoFA {
+				args = append(args, "--projects", testProject)
+			}
+			exit := a.Run(context.Background(), args)
+			if exit != 0 {
+				t.Fatal(exit, errout.String())
+			}
+			if !logout || twoFA && !loginVerified {
+				t.Fatal("session lifecycle incomplete")
+			}
+			path, _ := credentialPath("default")
+			stored, _ := os.ReadFile(path)
+			for _, secret := range []string{"session-secret", "password-secret", "proof-secret", "csrf-secret", "123456"} {
+				if bytes.Contains(stored, []byte(secret)) {
+					t.Fatal("bootstrap secret persisted")
+				}
+			}
+			if !bytes.Contains(stored, []byte(testToken)) {
+				t.Fatal("PAT missing")
+			}
+			for _, secret := range []string{testToken, "password-secret", "proof-secret", "csrf-secret"} {
+				if strings.Contains(out.String()+errout.String(), secret) {
+					t.Fatal("secret printed")
+				}
+			}
+		})
+	}
+}

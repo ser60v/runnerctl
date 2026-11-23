@@ -1,0 +1,133 @@
+package cli
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+
+	"go.yaml.in/yaml/v3"
+)
+
+type poolSpec struct {
+	Name          string `json:"name" yaml:"name"`
+	Environment   string `json:"environment" yaml:"environment"`
+	SiteID        string `json:"site_id" yaml:"site_id"`
+	CPU           int    `json:"cpu_millis" yaml:"cpu_millis"`
+	Memory        int    `json:"memory_mib" yaml:"memory_mib"`
+	Disk          int    `json:"disk_mib" yaml:"disk_mib"`
+	MaxJobMinutes int    `json:"max_job_minutes" yaml:"max_job_minutes"`
+	MaxRunners    int    `json:"max_runners" yaml:"max_runners"`
+	Enabled       *bool  `json:"enabled" yaml:"enabled"`
+}
+
+type manifest struct {
+	APIVersion string `yaml:"apiVersion"`
+	Kind       string `yaml:"kind"`
+	Context    string `yaml:"context"`
+	Metadata   struct {
+		ID             string `yaml:"id"`
+		OrganizationID string `yaml:"organization_id"`
+		ProjectID      string `yaml:"project_id"`
+	} `yaml:"metadata"`
+	Spec poolSpec `yaml:"spec"`
+}
+
+func readManifest(path string) (manifest, error) {
+	var m manifest
+	f, err := os.Open(path)
+	if err != nil {
+		return m, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 1024*1024+1))
+	if err != nil {
+		return m, err
+	}
+	if len(data) > 1024*1024 {
+		return m, errors.New("manifest exceeds 1 MiB")
+	}
+	var tree yaml.Node
+	if err := yaml.Unmarshal(data, &tree); err != nil {
+		return m, errors.New("invalid YAML")
+	}
+	if err := validateYAML(&tree); err != nil {
+		return m, err
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&m); err != nil {
+		return m, fmt.Errorf("invalid pool manifest: %w", err)
+	}
+	var extra any
+	if dec.Decode(&extra) != io.EOF {
+		return m, errors.New("exactly one YAML document is required")
+	}
+	if m.APIVersion != "runner.ser60v.com/v1" || m.Kind != "Pool" {
+		return m, errors.New("expected apiVersion runner.ser60v.com/v1 and kind Pool")
+	}
+	if !contextName.MatchString(m.Context) {
+		return m, errors.New("manifest context must name an existing CLI context")
+	}
+	for key, value := range map[string]string{"metadata.id": m.Metadata.ID, "metadata.organization_id": m.Metadata.OrganizationID, "metadata.project_id": m.Metadata.ProjectID} {
+		if err := validateUUID(key, value); err != nil {
+			return m, err
+		}
+	}
+	if m.Spec.SiteID != "" {
+		if !sitePattern.MatchString(m.Spec.SiteID) {
+			return m, errors.New("spec.site_id must be a site identifier from sites list")
+		}
+	}
+	if m.Spec.Enabled == nil || m.Spec.Name == "" || m.Spec.Environment == "" || m.Spec.CPU < 500 || m.Spec.Memory < 512 || m.Spec.Disk < 512 || m.Spec.MaxRunners < 1 || m.Spec.MaxJobMinutes < 1 {
+		return m, errors.New("spec requires name, environment, resources, max_runners, max_job_minutes and explicit enabled")
+	}
+	return m, nil
+}
+
+func validateYAML(n *yaml.Node) error {
+	if n.Kind == yaml.AliasNode || n.Anchor != "" {
+		return errors.New("YAML aliases and anchors are not supported")
+	}
+	if n.Tag != "" && n.Tag != "!!map" && n.Tag != "!!seq" && n.Tag != "!!str" && n.Tag != "!!int" && n.Tag != "!!bool" && n.Tag != "!!null" {
+		return errors.New("unsupported YAML tag")
+	}
+	if n.Kind == yaml.MappingNode {
+		seen := map[string]bool{}
+		for i := 0; i < len(n.Content); i += 2 {
+			key := n.Content[i]
+			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" || key.Value == "<<" || seen[key.Value] {
+				return errors.New("YAML mapping keys must be unique strings; merge keys are not supported")
+			}
+			seen[key.Value] = true
+		}
+	}
+	for _, child := range n.Content {
+		if err := validateYAML(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m manifest) body() []byte {
+	value := struct {
+		ProjectID string `json:"project_id"`
+		poolSpec
+	}{m.Metadata.ProjectID, m.Spec}
+	data, _ := json.Marshal(value)
+	return data
+}
+
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	b[6] = (b[6] & 15) | 64
+	b[8] = (b[8] & 63) | 128
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}

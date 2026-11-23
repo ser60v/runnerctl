@@ -1,0 +1,12 @@
+services:
+  runnerctl:
+    image: runnerctl-local:${CLI_VERSION:?CLI_VERSION is required}
+    build:
+      context: .
+      args:
+        APP_VERSION: ${CLI_VERSION}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    command: [version]

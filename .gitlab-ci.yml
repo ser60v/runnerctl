@@ -1,0 +1,64 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+stages: [test, package, release]
+
+default:
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
+    pull_policy: always
+  tags: [kubernetes, test]
+  interruptible: true
+
+variables:
+  GOTOOLCHAIN: local
+  GOCACHE: $CI_PROJECT_DIR/.runtime/go-build
+  GOMODCACHE: $CI_PROJECT_DIR/.runtime/go-mod
+
+check:
+  stage: test
+  script:
+    - make check
+
+package:
+  stage: package
+  needs: [check]
+  script:
+    - sh scripts/package.sh
+  artifacts:
+    expire_in: 7 days
+    paths: [.build/release/]
+
+release:
+  stage: release
+  needs: [package, build-container]
+  interruptible: false
+  resource_group: runnerctl-release
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: [VERSION]
+    - when: never
+  script:
+    - go run ./tools/publish
+
+build-container:
+  stage: package
+  needs: [check]
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/moby/buildkit:v0.32.2-rootless@sha256:60d1f642e29dc938bd6c109ba5500849fccf41921927c5339788b8227f57feb9
+    entrypoint: [""]
+    pull_policy: always
+  tags: [kubernetes, build]
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: [VERSION]
+    - when: never
+  script:
+    - sh scripts/build-container.sh
+  artifacts:
+    expire_in: 7 days
+    paths: [.buildkit-output/]

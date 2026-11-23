@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+.runtime
+.build
+.buildkit-output
+pool.yaml
+README.md
+compose.yml

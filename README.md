@@ -7,7 +7,8 @@ projects in one organization.
 
 ## Install and sign in
 
-Release archives contain a standalone `runnerctl` binary for Linux and macOS
+[Release archives](https://git.ser60v.com/retardsoftware/runner-platform/cli/-/releases)
+contain a standalone `runnerctl` binary for Linux and macOS
 (amd64/arm64), `VERSION`, and this README. Verify the archive against the release
 `SHA256SUMS`, extract it, and put the binary on your PATH. Windows users can use
 the Linux binary in WSL. Native Windows credential storage is not supported yet.

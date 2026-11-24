@@ -95,7 +95,7 @@ before lowering it. `init --cpu`, `--memory` and `--disk` accept mCPU/MiB;
 the initial values above are a starting point, not a promise of capacity.
 Use `--site SITE_ID` from `sites list` and `--environment ENVIRONMENT_ID` from
 `environments list` to initialize an explicitly placed pool. Site identifiers
-are names such as `desktop-i9`, not project UUIDs.
+are names such as `desktop-wsl-i9`, not project UUIDs.
 
 `plan` validates environment, site, storage requirements and quota through the
 server without reserving resources. It returns the current revision, changes

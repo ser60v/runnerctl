@@ -1,14 +1,14 @@
 # runnerctl
 
-Manage Runner Platform pools and jobs from a terminal or an automation agent.
+Manage Runner Platform pools, jobs and runner allocations from a terminal or an automation agent.
 The CLI uses the same public API as the web application. A pool YAML holds
 desired configuration; a personal token holds access to explicitly selected
 projects in one organization.
 
 ## Install and sign in
 
-[Release archives](https://git.ser60v.com/retardsoftware/runner-platform/cli/-/releases)
-contain a standalone `runnerctl` binary for Linux and macOS
+[Public release metadata](https://runners.retardsoftware.com/downloads/runnerctl/latest/metadata.json)
+provides same-origin downloads of a standalone `runnerctl` binary for Linux and macOS
 (amd64/arm64), `VERSION`, and this README. Verify the archive against the release
 `SHA256SUMS`, extract it, and put the binary on your PATH. Windows users can use
 the Linux binary in WSL. Native Windows credential storage is not supported yet.
@@ -120,12 +120,17 @@ runnerctl pools delete POOL_UUID
 runnerctl environments list
 runnerctl sites list
 runnerctl status
+runnerctl status watch --interval 5s --timeout 15m
 runnerctl workflows list --project PROJECT_UUID
 runnerctl workflows jobs WORKFLOW_GROUP_UUID
 runnerctl runs list --project PROJECT_UUID --status running --limit 50 --offset 0
 runnerctl runs get JOB_UUID
 runnerctl runs watch JOB_UUID --timeout 15m --interval 5s
 runnerctl runs cancel JOB_UUID
+runnerctl runners list --project PROJECT_UUID --pool POOL_UUID
+runnerctl runners list --all
+runnerctl runners get RUNNER_UUID
+runnerctl runners watch RUNNER_UUID --timeout 15m
 ```
 
 `runs` are individual tracked jobs; `workflows` are grouped GitHub workflow
@@ -136,6 +141,20 @@ Pool deletion fetches and checks its revision. Public platform status needs no
 token. Administrative accounts, secrets, billing and GitHub installations are
 outside the personal-token route allowlist.
 
+Runner lists contain durable API allocation records, including allocations whose VM
+may not yet exist. `--all` includes completed records. Detail and watch attempt a
+bounded Manager read; inspect `observation_source`, `manager_status`, and nullable
+`phase`/`site_id`. `manager_observed_at` is fetch time, not a VM heartbeat.
+`started_at` and duration describe allocation accounting; `running` is a controller
+phase and does not alone prove the runner process started. CPU, memory and disk
+are reservations, not live usage. A job's `execution_id` identifies its assigned
+runner when known. `trigger_run_id` is a provisioning trigger, not an assignment.
+
+The unauthenticated [web guide](https://runners.retardsoftware.com/docs/cli) and
+[agent guide](https://runners.retardsoftware.com/docs/cli.md) cover setup and
+troubleshooting. `runnerctl --json help` or `runnerctl schema` provides the
+offline, versioned command contract without credentials or network access.
+
 ## Automation contract
 
 Global flags precede the command:
@@ -144,21 +163,25 @@ Global flags precede the command:
 runnerctl --json plan -f pool.yaml
 runnerctl --json apply -f pool.yaml
 runnerctl --json runs watch JOB_UUID --timeout 30m
+runnerctl --json runners watch RUNNER_UUID --timeout 30m
+runnerctl schema
 ```
 
 Ordinary JSON commands emit one object; watch emits one compact JSON object per
 observation (NDJSON) on stdout. Diagnostics and structured errors go to stderr.
-Watch stops on success, failure, cancellation, job timeout or infrastructure
-error. It obeys `Retry-After` for temporary `429`/`503` responses, has a finite
+Run watch stops on a terminal job outcome. Runner watch additionally waits for
+a verified Manager `done` phase: cleanup and accounting must have finished.
+An API terminal projection or unavailable Manager alone cannot complete it.
+Public `status watch` streams until its finite deadline or interruption. Watch obeys `Retry-After` for temporary `429`/`503` responses, has a finite
 timeout, and exits on Ctrl-C. Mutations are not blindly retried.
 
 | Exit | Meaning |
 |---|---|
-| 0 | Successful operation or completed successful job |
+| 0 | Successful operation or successful observed job/runner |
 | 1 | Authentication, authorization, transport or other request failure |
 | 2 | Invalid input/command/manifest |
 | 3 | Conflict or stale revision (`409`/`412`) |
-| 4 | Observed job ended unsuccessfully, including cancellation |
+| 4 | Observed job/runner ended unsuccessfully, including cancellation |
 | 5 | Watch deadline expired |
 | 130 | Interrupted |
 
@@ -185,6 +208,8 @@ in place.
 | `GET /api/app/v1/pools/{id}` | Read a pool and its ETag |
 | `POST /api/app/v1/pools/{id}/plan` | Validate a complete desired pool without writes |
 | `PUT /api/app/v1/pools/{id}` | Create/update a stable pool ID with preconditions |
+| `GET /api/app/v1/runners` | Project-scoped allocation list with pagination and filters |
+| `GET /api/app/v1/runners/{id}` | Allocation detail with bounded Manager observation |
 
 The Auth and API repositories contain the authoritative OpenAPI schemas. CLI
 pool writes reuse the existing UI validation; there is no second scheduler or

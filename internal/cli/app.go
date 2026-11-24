@@ -50,8 +50,13 @@ Commands:
   runs list [--project UUID] [--status STATUS] [--limit 50] [--offset 0]
   runs get UUID | cancel UUID
   runs watch UUID [--interval 5s] [--timeout 15m]
+  runners list [--all] [--project UUID] [--pool UUID] [--status STATUS]
+               [--limit 50] [--offset 0]
+  runners get UUID | watch UUID [--interval 5s] [--timeout 15m]
   workflows list [--project UUID] | jobs UUID
   projects list | environments list | sites list | status | version
+  status watch [--interval 5s] [--timeout 15m]
+  schema          offline JSON command contract (also: --json help)
 
 RUNNERCTL_TOKEN supplies an ephemeral token; RUNNERCTL_CONFIG_DIR selects storage.
 Tokens never belong in a pool YAML. auth logout removes local credentials only.
@@ -73,6 +78,9 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	f.BoolVar(&a.json, "json", false, "JSON output")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			if a.json {
+				return a.printSchema()
+			}
 			fmt.Fprint(a.Out, help)
 			return 0
 		}
@@ -80,6 +88,9 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	}
 	args = f.Args()
 	if len(args) == 0 || args[0] == "help" {
+		if a.json {
+			return a.printSchema()
+		}
 		fmt.Fprint(a.Out, help)
 		return 0
 	}
@@ -95,6 +106,11 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	}
 	var err error
 	switch args[0] {
+	case "schema":
+		if len(args) != 1 {
+			return a.failure(usage("schema takes no arguments"), 2)
+		}
+		return a.printSchema()
 	case "version":
 		err = a.output(map[string]any{"version": a.Version})
 	case "auth":
@@ -104,23 +120,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "plan", "apply":
 		err = a.manifestCommand(ctx, args[0], args[1:])
 	case "status":
-		server := a.server
-		if server == "" {
-			if c, e := loadCredential(a.context); e == nil {
-				server = c.Server
-			} else if !os.IsNotExist(e) {
-				err = e
-				break
-			} else {
-				server = defaultServer
-			}
-		}
-		var res response
-		res, err = newClient(server, "").json(ctx, "GET", "/api/app/v1/status", nil)
-		if err == nil {
-			err = a.output(res.Body)
-		}
-	case "pools", "runs", "jobs", "workflows", "projects", "environments", "sites":
+		err = a.statusCommand(ctx, args[1:])
+	case "pools", "runs", "jobs", "runners", "workflows", "projects", "environments", "sites":
 		err = a.resource(ctx, args[0], args[1:])
 	default:
 		err = &commandError{message: "unknown command: " + args[0], exit: 2}
@@ -384,11 +385,14 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 	if resource == "runs" && sub == "watch" {
 		return a.watchCommand(ctx, args)
 	}
+	if resource == "runners" && sub == "watch" {
+		return a.runnerWatchCommand(ctx, args)
+	}
 	c, err := a.client()
 	if err != nil {
 		return err
 	}
-	paths := map[string]string{"pools": "pools", "runs": "runs", "workflows": "workflow-runs", "projects": "projects", "environments": "runner-environments", "sites": "hardware"}
+	paths := map[string]string{"pools": "pools", "runs": "runs", "runners": "runners", "workflows": "workflow-runs", "projects": "projects", "environments": "runner-environments", "sites": "hardware"}
 	path := "/api/app/v1/" + paths[resource]
 	method := "GET"
 	var headers http.Header
@@ -399,6 +403,12 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 		status := f.String("status", "", "status")
 		limit := f.Int("limit", 50, "page size")
 		offset := f.Int("offset", 0, "page offset")
+		var pool string
+		var all bool
+		if resource == "runners" {
+			f.StringVar(&pool, "pool", "", "pool UUID")
+			f.BoolVar(&all, "all", false, "include completed allocations")
+		}
 		if err := f.Parse(args); err != nil {
 			return usage(err.Error())
 		}
@@ -406,6 +416,18 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 			return usage("unexpected list arguments")
 		}
 		q := url.Values{}
+		if resource == "runners" {
+			q.Set("active", strconv.FormatBool(!all))
+			if pool != "" {
+				if err := validateUUID("pool", pool); err != nil {
+					return usage(err.Error())
+				}
+				q.Set("pool_id", pool)
+			}
+			if *status != "" && !runnerStatus(*status) {
+				return usage("unknown runner status")
+			}
+		}
 		if *project != "" {
 			if err := validateUUID("project", *project); err != nil {
 				return usage(err.Error())
@@ -428,7 +450,7 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 		if err := validateUUID("id", args[0]); err != nil {
 			return usage(err.Error())
 		}
-		if !((sub == "get" && (resource == "runs" || resource == "pools")) || (sub == "delete" && resource == "pools") || (sub == "cancel" && resource == "runs") || (sub == "jobs" && resource == "workflows")) {
+		if !((sub == "get" && (resource == "runs" || resource == "runners" || resource == "pools")) || (sub == "delete" && resource == "pools") || (sub == "cancel" && resource == "runs") || (sub == "jobs" && resource == "workflows")) {
 			return usage("unsupported resource operation")
 		}
 		path += "/" + args[0]
@@ -460,6 +482,9 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 	}
 	if !a.json && resource == "runs" && sub == "list" {
 		return a.printRuns(res.Body)
+	}
+	if !a.json && resource == "runners" && sub == "list" {
+		return a.printRunners(res.Body)
 	}
 	return a.output(res.Body)
 }
@@ -545,7 +570,7 @@ func (a *App) watch(ctx context.Context, c *client, id string, interval time.Dur
 			if ae.RetryAfter > delay {
 				delay = ae.RetryAfter
 			}
-			fmt.Fprintln(a.Err, "runnerctl: temporarily unavailable; retrying")
+			a.retryNotice(delay)
 		} else {
 			var run struct {
 				Status   string  `json:"status"`

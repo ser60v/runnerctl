@@ -100,7 +100,7 @@ runnerctl apply -f pool.yaml
 ID in version control so subsequent applies update the same pool. Example:
 
 ```yaml
-apiVersion: runner.ser60v.com/v1
+apiVersion: runner.retardsoftware.com/v1
 kind: Pool
 context: default
 metadata:
@@ -118,6 +118,9 @@ spec:
   max_runners: 3
   enabled: true
 ```
+
+`runnerctl` 0.1.4 and later generate `runner.retardsoftware.com/v1`. Existing
+manifests using `runner.ser60v.com/v1` remain supported with the same behavior.
 
 Resources are **per worker**, while `max_runners` is the pool concurrency cap.
 Three workers with these values need 6 CPUs, 24 GiB RAM and 123,264 MiB reserved

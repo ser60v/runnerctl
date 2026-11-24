@@ -261,7 +261,7 @@ func (a *App) initPool(args []string) error {
 		return usage("invalid site identifier")
 	}
 	enabled := true
-	m := manifest{APIVersion: "runner.ser60v.com/v1", Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: *memory, Disk: *disk, MaxJobMinutes: 60, MaxRunners: *concurrency, Enabled: &enabled}}
+	m := manifest{APIVersion: poolAPIVersion, Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: *memory, Disk: *disk, MaxJobMinutes: 60, MaxRunners: *concurrency, Enabled: &enabled}}
 	m.Metadata.ID = newUUID()
 	m.Metadata.OrganizationID = *org
 	m.Metadata.ProjectID = *project

@@ -38,7 +38,7 @@ func identityResponse() any {
 }
 func example() manifest {
 	enabled := true
-	m := manifest{APIVersion: "runner.ser60v.com/v1", Kind: "Pool", Context: "default", Spec: poolSpec{Name: "linux-ci", Environment: "ubuntu-latest", CPU: 2000, Memory: 8192, Disk: 41088, MaxJobMinutes: 60, MaxRunners: 3, Enabled: &enabled}}
+	m := manifest{APIVersion: "runner.retardsoftware.com/v1", Kind: "Pool", Context: "default", Spec: poolSpec{Name: "linux-ci", Environment: "ubuntu-latest", CPU: 2000, Memory: 8192, Disk: 41088, MaxJobMinutes: 60, MaxRunners: 3, Enabled: &enabled}}
 	m.Metadata.ID = testPool
 	m.Metadata.OrganizationID = testOrg
 	m.Metadata.ProjectID = testProject
@@ -82,6 +82,57 @@ func TestStrictManifestRejectsAmbiguityAndExecutableConfiguration(t *testing.T) 
 	m, err := readManifest(manifestFile(t, literal))
 	if err != nil || m.Spec.Name != "$(touch /tmp/should-not-exist)" {
 		t.Fatal("literal configuration was not preserved", err)
+	}
+}
+
+func TestPoolManifestVersions(t *testing.T) {
+	for _, version := range []string{"runner.retardsoftware.com/v1", "runner.ser60v.com/v1", "runner.retardsoftware.com/v2", "runner.ser60v.com/v2", "other.example/v1", ""} {
+		t.Run(version, func(t *testing.T) {
+			m := example()
+			m.APIVersion = version
+			b, err := yaml.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := readManifest(manifestFile(t, string(b)))
+			supported := version == "runner.retardsoftware.com/v1" || version == "runner.ser60v.com/v1"
+			if !supported {
+				if err == nil {
+					t.Fatal("unsupported manifest version accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Metadata != m.Metadata || got.Context != m.Context || !bytes.Equal(got.body(), m.body()) {
+				t.Fatal("schema version changed the target or desired pool")
+			}
+			m.Kind = "Other"
+			b, err = yaml.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readManifest(manifestFile(t, string(b))); err == nil {
+				t.Fatal("unsupported manifest kind accepted")
+			}
+		})
+	}
+}
+
+func TestInitEmitsCurrentPoolSchema(t *testing.T) {
+	setup(t)
+	path := filepath.Join(t.TempDir(), "pool.yaml")
+	a := New(nil, io.Discard, io.Discard, "test")
+	if code := a.Run(context.Background(), []string{"init", "--organization", testOrg, "--project", testProject, "-f", path}); code != 0 {
+		t.Fatalf("init exited with %d", code)
+	}
+	m, err := readManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.APIVersion != "runner.retardsoftware.com/v1" || m.Metadata.OrganizationID != testOrg || m.Metadata.ProjectID != testProject {
+		t.Fatal("init did not emit the current schema and requested scope")
 	}
 }
 

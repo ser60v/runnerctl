@@ -112,8 +112,8 @@ spec:
   environment: ubuntu-latest
   site_id: ""
   cpu_millis: 2000
-  memory_mib: 8192
-  disk_mib: 41088
+  memory: 8gb
+  disk: 40.125gb
   max_job_minutes: 60
   max_runners: 3
   enabled: true
@@ -127,7 +127,17 @@ Three workers with these values need 6 CPUs, 24 GiB RAM and 123,264 MiB reserved
 disk. Available organization/project budgets and eligible sites must fit those
 totals. Disk reservation includes site-specific execution overhead; it is not
 necessarily the writable workspace size. Inspect `sites list` and `plan`
-before lowering it. `init --cpu`, `--memory` and `--disk` accept mCPU/MiB;
+before lowering it. `init --cpu` accepts mCPU. `init --memory` and `--disk`
+accept sizes such as `8gb`, `40.125gb`, `40,125 GB`, and `512mb`. Surrounding
+spaces and a space before the unit are accepted. Decimal comma is accepted;
+grouping separators are not. Units are case insensitive:
+`mb`/`mib`, `gb`/`gib`, and `tb`/`tib` use binary multiples of MiB. A bare
+integer is MiB for compatibility. Values must resolve to a positive whole MiB;
+fractional MiB, negative values, exponents, and overflow are rejected. Pool
+YAML uses `memory` and `disk`; existing `memory_mib` and `disk_mib` fields
+remain accepted as integers or unit strings. Supplying both names for one
+resource is rejected. API and `--json` resource fields remain integer MiB.
+For example, `40gb` is 40960 MiB and `40.125gb` is 41088 MiB;
 the initial values above are a starting point, not a promise of capacity.
 Use `--site SITE_ID` from `sites list` and `--environment ENVIRONMENT_ID` from
 `environments list` to initialize an explicitly placed pool. Site identifiers

@@ -44,6 +44,7 @@ Commands:
              [--name NAME] [--scopes SCOPE,...] [--ttl 168h] [--email EMAIL]
   auth status | logout | tokens | revoke TOKEN_ID
   init --organization UUID --project UUID [-f pool.yaml] [--concurrency 3]
+       [--memory 8gb] [--disk 40.125gb]
   plan -f pool.yaml
   apply -f pool.yaml
   pools list [--project UUID] | get UUID | delete UUID
@@ -240,8 +241,8 @@ func (a *App) initPool(args []string) error {
 	environment := f.String("environment", "ubuntu-latest", "runner environment")
 	concurrency := f.Int("concurrency", 3, "parallel jobs")
 	cpu := f.Int("cpu", 2000, "mCPU per job")
-	memory := f.Int("memory", 8192, "MiB per job")
-	disk := f.Int("disk", 41088, "MiB reserved per job")
+	memory := f.String("memory", "8gb", "memory per job (e.g. 8gb; bare integer is MiB)")
+	disk := f.String("disk", "40.125gb", "disk reserved per job (e.g. 40gb; bare integer is MiB)")
 	if err := f.Parse(args); err != nil {
 		return usage(err.Error())
 	}
@@ -254,14 +255,22 @@ func (a *App) initPool(args []string) error {
 	if err := validateUUID("project", *project); err != nil {
 		return usage(err.Error())
 	}
-	if *concurrency < 1 || *concurrency > 1000 || *cpu < 500 || *memory < 512 || *disk < 512 {
+	memoryMiB, err := parseSize(*memory)
+	if err != nil {
+		return usage("invalid --memory: " + err.Error())
+	}
+	diskMiB, err := parseSize(*disk)
+	if err != nil {
+		return usage("invalid --disk: " + err.Error())
+	}
+	if *concurrency < 1 || *concurrency > 1000 || *cpu < 500 || memoryMiB < 512 || diskMiB < 512 {
 		return usage("invalid resource values")
 	}
 	if *site != "" && !sitePattern.MatchString(*site) {
 		return usage("invalid site identifier")
 	}
 	enabled := true
-	m := manifest{APIVersion: poolAPIVersion, Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: *memory, Disk: *disk, MaxJobMinutes: 60, MaxRunners: *concurrency, Enabled: &enabled}}
+	m := manifest{APIVersion: poolAPIVersion, Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: memoryMiB, Disk: diskMiB, MaxJobMinutes: 60, MaxRunners: *concurrency, Enabled: &enabled}}
 	m.Metadata.ID = newUUID()
 	m.Metadata.OrganizationID = *org
 	m.Metadata.ProjectID = *project

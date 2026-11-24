@@ -22,7 +22,7 @@ func (a *App) printSchema() int {
 		{Command: "auth logout", Mutates: true, Output: "ok", Notes: "Removes local credentials only."},
 		{Command: "auth tokens", Output: "tokens", Notes: "Interactive account authentication."},
 		{Command: "auth revoke", Args: "TOKEN_ID", Mutates: true, Output: "ok", Notes: "Interactive account authentication."},
-		{Command: "init", Args: "--organization UUID --project UUID [-f pool.yaml] [--name linux-ci] [--concurrency 3] [--environment ubuntu-latest] [--site SITE_ID] [--cpu 2000] [--memory 8192] [--disk 41088]", Mutates: true, Public: true, Output: "file, pool_id and next command", Notes: "Creates a local YAML; never executes configuration. CPU mCPU, memory/disk MiB per runner."},
+		{Command: "init", Args: "--organization UUID --project UUID [-f pool.yaml] [--name linux-ci] [--concurrency 3] [--environment ubuntu-latest] [--site SITE_ID] [--cpu 2000] [--memory 8gb] [--disk 40.125gb]", Mutates: true, Public: true, Output: "file, pool_id and next command", Notes: "Creates a local YAML; never executes configuration. CPU is mCPU. Memory/disk accept mb/mib, gb/gib, tb/tib (binary multiples), or bare integer MiB; YAML uses memory/disk, legacy memory_mib/disk_mib remain accepted. API JSON remains integer MiB."},
 		{Command: "plan", Args: "-f pool.yaml", Scopes: []string{"catalog.read", "pools.write"}, Output: "pool plan"},
 		{Command: "apply", Args: "-f pool.yaml", Scopes: []string{"catalog.read", "pools.read", "pools.write"}, Mutates: true, Output: "action and pool", Notes: "Optimistic concurrency; exit 3 requires a fresh plan. No blind mutation retries."},
 		{Command: "pools list", Args: "[--project UUID] [--limit 50] [--offset 0]", Scopes: []string{"pools.read"}, Output: "pools"},

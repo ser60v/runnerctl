@@ -136,6 +136,102 @@ func TestInitEmitsCurrentPoolSchema(t *testing.T) {
 	}
 }
 
+func TestSizeConversionIsExact(t *testing.T) {
+	for input, want := range map[string]int{
+		"40gb": 40960, "40.125gb": 41088, "40.125GiB": 41088,
+		"8GB": 8192, "8192": 8192, "512mb": 512, "1tb": 1048576,
+		"0.5gib": 512, "1.0009765625gb": 1025, " 40 GB ": 40960,
+		"40,125 GB": 41088,
+	} {
+		got, err := parseSize(input)
+		if err != nil || got != want {
+			t.Errorf("parseSize(%q) = %d, %v; want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "0", "-1gb", "+1gb", "NaN", "1e3gb", "1.1mb", "0.0001gb", "1.5", "1kb", "1,234,567gb", "1,5.0gb", "1 G B", "999999999999999999999999tb"} {
+		if _, err := parseSize(input); err == nil {
+			t.Errorf("parseSize(%q) accepted invalid size", input)
+		}
+	}
+	for size, want := range map[int]string{512: "512mb", 8192: "8gb", 41088: "40.125gb", 1025: "1025mb", 1048576: "1tb"} {
+		if got := formatSize(size); got != want {
+			t.Errorf("formatSize(%d) = %q; want %q", size, got, want)
+		}
+	}
+}
+
+func TestManifestSizeAliasesAndStrictness(t *testing.T) {
+	b, err := yaml.Marshal(example())
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := string(b)
+	if !strings.Contains(good, "memory: 8gb\n") || !strings.Contains(good, "disk: 40.125gb\n") {
+		t.Fatalf("YAML does not contain readable exact sizes: %s", good)
+	}
+	for _, replacement := range []string{"memory_mib: 8192", "memory_mib: 8gb", "memory_mib: '8GiB'", "memory: 8192"} {
+		text := strings.Replace(good, "memory: 8gb", replacement, 1)
+		got, err := readManifest(manifestFile(t, text))
+		if err != nil || got.Spec.Memory != 8192 {
+			t.Errorf("compatible memory %q: %v", replacement, err)
+		}
+	}
+	for _, replacement := range []string{"disk_mib: 41088", "disk_mib: 40.125gb", "disk: 41088"} {
+		text := strings.Replace(good, "disk: 40.125gb", replacement, 1)
+		got, err := readManifest(manifestFile(t, text))
+		if err != nil || got.Spec.Disk != 41088 {
+			t.Errorf("compatible disk %q: %v", replacement, err)
+		}
+	}
+	for _, text := range []string{
+		strings.Replace(good, "memory: 8gb", "memory: 8gb\n    memory_mib: 8192", 1),
+		strings.Replace(good, "disk: 40.125gb", "disk: 40.125gb\n    disk_mib: 41088", 1),
+		strings.Replace(good, "memory: 8gb", "memory: 8gb\n    memory: 8gb", 1),
+		strings.Replace(good, "memory: 8gb", "memry: 8gb", 1),
+		strings.Replace(good, "memory: 8gb", "memory: 1.1mb", 1),
+	} {
+		if _, err := readManifest(manifestFile(t, text)); err == nil {
+			t.Errorf("accepted ambiguous or invalid YAML:\n%s", text)
+		}
+	}
+}
+
+func TestInitSizeFlagsPreserveRequestValues(t *testing.T) {
+	setup(t)
+	for _, tc := range []struct {
+		memory, disk         string
+		wantMemory, wantDisk int
+	}{{"8GB", "40gb", 8192, 40960}, {"8192", "41088", 8192, 41088}, {"0.5gib", "40.125gb", 512, 41088}, {" 8 GB ", "40,125 GB", 8192, 41088}} {
+		path := filepath.Join(t.TempDir(), "pool.yaml")
+		var stderr bytes.Buffer
+		a := New(nil, io.Discard, &stderr, "test")
+		if code := a.Run(context.Background(), []string{"init", "--organization", testOrg, "--project", testProject, "--memory", tc.memory, "--disk", tc.disk, "-f", path}); code != 0 {
+			t.Fatalf("init returned %d: %s", code, stderr.String())
+		}
+		m, err := readManifest(path)
+		if err != nil || m.Spec.Memory != tc.wantMemory || m.Spec.Disk != tc.wantDisk {
+			t.Fatalf("init/read values = %d/%d, %v; want %d/%d", m.Spec.Memory, m.Spec.Disk, err, tc.wantMemory, tc.wantDisk)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(m.body(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["memory_mib"] != float64(tc.wantMemory) || body["disk_mib"] != float64(tc.wantDisk) {
+			t.Fatalf("API body changed units: %v", body)
+		}
+	}
+	for _, bad := range []string{"1.1mb", "NaN", "-1gb", "1e3gb"} {
+		path := filepath.Join(t.TempDir(), "pool.yaml")
+		a := New(nil, io.Discard, io.Discard, "test")
+		if code := a.Run(context.Background(), []string{"init", "--organization", testOrg, "--project", testProject, "--memory", bad, "-f", path}); code != 2 {
+			t.Errorf("init accepted %q: code %d", bad, code)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("init wrote a file for %q", bad)
+		}
+	}
+}
+
 func TestCredentialsPrivateAndOriginBound(t *testing.T) {
 	setup(t)
 	if err := saveCredential("default", credential{"https://one.example", testToken}); err != nil {

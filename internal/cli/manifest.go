@@ -19,11 +19,94 @@ type poolSpec struct {
 	Environment   string `json:"environment" yaml:"environment"`
 	SiteID        string `json:"site_id" yaml:"site_id"`
 	CPU           int    `json:"cpu_millis" yaml:"cpu_millis"`
-	Memory        int    `json:"memory_mib" yaml:"memory_mib"`
-	Disk          int    `json:"disk_mib" yaml:"disk_mib"`
+	Memory        int    `json:"memory_mib" yaml:"-"`
+	Disk          int    `json:"disk_mib" yaml:"-"`
 	MaxJobMinutes int    `json:"max_job_minutes" yaml:"max_job_minutes"`
 	MaxRunners    int    `json:"max_runners" yaml:"max_runners"`
 	Enabled       *bool  `json:"enabled" yaml:"enabled"`
+}
+
+type poolSpecYAML struct {
+	Name          string `yaml:"name"`
+	Environment   string `yaml:"environment"`
+	SiteID        string `yaml:"site_id"`
+	CPU           int    `yaml:"cpu_millis"`
+	Memory        string `yaml:"memory"`
+	Disk          string `yaml:"disk"`
+	MaxJobMinutes int    `yaml:"max_job_minutes"`
+	MaxRunners    int    `yaml:"max_runners"`
+	Enabled       *bool  `yaml:"enabled"`
+}
+
+func (s poolSpec) MarshalYAML() (any, error) {
+	return poolSpecYAML{s.Name, s.Environment, s.SiteID, s.CPU, formatSize(s.Memory), formatSize(s.Disk), s.MaxJobMinutes, s.MaxRunners, s.Enabled}, nil
+}
+
+func (s *poolSpec) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("spec must be a mapping")
+	}
+	var memoryNode, diskNode *yaml.Node
+	valid := map[string]bool{"name": true, "environment": true, "site_id": true, "cpu_millis": true, "memory": true, "disk": true, "memory_mib": true, "disk_mib": true, "max_job_minutes": true, "max_runners": true, "enabled": true}
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if !valid[key] {
+			return fmt.Errorf("unknown spec field %q", key)
+		}
+		switch key {
+		case "memory", "memory_mib":
+			if memoryNode != nil {
+				return errors.New("spec.memory and spec.memory_mib cannot both be supplied")
+			}
+			memoryNode = value
+		case "disk", "disk_mib":
+			if diskNode != nil {
+				return errors.New("spec.disk and spec.disk_mib cannot both be supplied")
+			}
+			diskNode = value
+		}
+	}
+	var raw struct {
+		Name          string `yaml:"name"`
+		Environment   string `yaml:"environment"`
+		SiteID        string `yaml:"site_id"`
+		CPU           int    `yaml:"cpu_millis"`
+		MaxJobMinutes int    `yaml:"max_job_minutes"`
+		MaxRunners    int    `yaml:"max_runners"`
+		Enabled       *bool  `yaml:"enabled"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	*s = poolSpec{Name: raw.Name, Environment: raw.Environment, SiteID: raw.SiteID, CPU: raw.CPU, MaxJobMinutes: raw.MaxJobMinutes, MaxRunners: raw.MaxRunners, Enabled: raw.Enabled}
+	var err error
+	if s.Memory, err = sizeFromYAML(memoryNode); err != nil {
+		return fmt.Errorf("spec.memory: %w", err)
+	}
+	if s.Disk, err = sizeFromYAML(diskNode); err != nil {
+		return fmt.Errorf("spec.disk: %w", err)
+	}
+	return nil
+}
+
+func sizeFromYAML(node *yaml.Node) (int, error) {
+	if node == nil {
+		return 0, errors.New("missing size")
+	}
+	if node.Kind != yaml.ScalarNode || (node.Tag != "!!str" && node.Tag != "!!int") {
+		return 0, errors.New("size must be a string with units or an integer MiB value")
+	}
+	if node.Tag == "!!int" {
+		var value int
+		if err := node.Decode(&value); err != nil {
+			return 0, err
+		}
+		if value <= 0 {
+			return 0, errors.New("size must be positive")
+		}
+		return value, nil
+	}
+	return parseSize(node.Value)
 }
 
 type manifest struct {

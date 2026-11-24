@@ -124,14 +124,21 @@ func TestInitEmitsCurrentPoolSchema(t *testing.T) {
 	setup(t)
 	path := filepath.Join(t.TempDir(), "pool.yaml")
 	a := New(nil, io.Discard, io.Discard, "test")
-	if code := a.Run(context.Background(), []string{"init", "--organization", testOrg, "--project", testProject, "-f", path}); code != 0 {
+	if code := a.Run(context.Background(), []string{"init", "--project", testProject, "-f", path}); code != 0 {
 		t.Fatalf("init exited with %d", code)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("organization_id")) {
+		t.Fatal("init emitted an organization field for the ordinary workflow")
 	}
 	m, err := readManifest(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.APIVersion != "runner.retardsoftware.com/v1" || m.Metadata.OrganizationID != testOrg || m.Metadata.ProjectID != testProject {
+	if m.APIVersion != "runner.retardsoftware.com/v1" || m.Metadata.OrganizationID != "" || m.Metadata.ProjectID != testProject {
 		t.Fatal("init did not emit the current schema and requested scope")
 	}
 }
@@ -364,12 +371,136 @@ func TestManifestCannotChangeOrganization(t *testing.T) {
 	m := example()
 	m.Metadata.OrganizationID = testPool
 	b, _ := yaml.Marshal(m)
-	a := New(nil, io.Discard, io.Discard, "test")
-	if exit := a.Run(context.Background(), []string{"apply", "-f", manifestFile(t, string(b))}); exit == 0 {
-		t.Fatal("foreign org accepted")
+	path := manifestFile(t, string(b))
+	for _, command := range []string{"plan", "apply"} {
+		a := New(nil, io.Discard, io.Discard, "test")
+		if exit := a.Run(context.Background(), []string{command, "-f", path}); exit == 0 {
+			t.Fatal("foreign org accepted by", command)
+		}
 	}
-	if calls != 1 {
-		t.Fatal("wrote before organization verification")
+	if calls != 2 {
+		t.Fatal("planned or wrote before organization verification")
+	}
+}
+
+func TestManifestWithoutOrganizationUsesTokenProject(t *testing.T) {
+	for _, command := range []string{"plan", "apply"} {
+		t.Run(command, func(t *testing.T) {
+			setup(t)
+			identityCalls, planCalls, writes := 0, 0, 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == "GET" && r.URL.Path == "/api/app/v1/cli/context":
+					identityCalls++
+					reply(w, identityResponse())
+				case r.Method == "POST" && r.URL.Path == "/api/app/v1/pools/"+testPool+"/plan":
+					planCalls++
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if body["project_id"] != testProject || body["memory_mib"] != float64(8192) || body["disk_mib"] != float64(41088) {
+						t.Error("wrong plan body", body)
+					}
+					reply(w, map[string]any{"pool_id": testPool, "revision": 0, "action": "create", "errors": []any{}})
+				case r.Method == "PUT" && r.URL.Path == "/api/app/v1/pools/"+testPool:
+					writes++
+					if r.Header.Get("If-None-Match") != "*" {
+						t.Error("missing create precondition")
+					}
+					reply(w, map[string]any{"id": testPool, "revision": 1})
+				default:
+					t.Error("unexpected request", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+				t.Fatal(err)
+			}
+			m := example()
+			m.Metadata.OrganizationID = ""
+			b, err := yaml.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(b, []byte("organization_id")) {
+				t.Fatal("empty organization field was emitted")
+			}
+			var stderr bytes.Buffer
+			a := New(nil, io.Discard, &stderr, "test")
+			if exit := a.Run(context.Background(), []string{command, "-f", manifestFile(t, string(b))}); exit != 0 {
+				t.Fatalf("%s failed: exit %d: %s", command, exit, stderr.String())
+			}
+			wantWrites := 0
+			if command == "apply" {
+				wantWrites = 1
+			}
+			if identityCalls != 1 || planCalls != 1 || writes != wantWrites {
+				t.Fatalf("identity=%d plan=%d writes=%d", identityCalls, planCalls, writes)
+			}
+		})
+	}
+}
+
+func TestManifestWithoutOrganizationRejectsInaccessibleProject(t *testing.T) {
+	setup(t)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/api/app/v1/cli/context" {
+			t.Error("request after inaccessible project", r.Method, r.URL.Path)
+		}
+		identity := identityResponse().(map[string]any)
+		identity["projects"] = []any{}
+		reply(w, identity)
+	}))
+	defer srv.Close()
+	if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+		t.Fatal(err)
+	}
+	m := example()
+	m.Metadata.OrganizationID = ""
+	b, _ := yaml.Marshal(m)
+	path := manifestFile(t, string(b))
+	for _, command := range []string{"plan", "apply"} {
+		a := New(nil, io.Discard, io.Discard, "test")
+		if exit := a.Run(context.Background(), []string{command, "-f", path}); exit == 0 {
+			t.Fatal("inaccessible project accepted by", command)
+		}
+	}
+	if calls != 2 {
+		t.Fatal("expected only identity requests, got", calls)
+	}
+}
+
+func TestMalformedExplicitOrganizationIsRejected(t *testing.T) {
+	m := example()
+	m.Metadata.OrganizationID = "not-a-uuid"
+	b, _ := yaml.Marshal(m)
+	if _, err := readManifest(manifestFile(t, string(b))); err == nil {
+		t.Fatal("malformed explicit organization accepted")
+	}
+	m.Metadata.OrganizationID = ""
+	b, _ = yaml.Marshal(m)
+	for _, value := range []string{`""`, "null"} {
+		text := strings.Replace(string(b), "  project_id: "+testProject, "  organization_id: "+value+"\n  project_id: "+testProject, 1)
+		if _, err := readManifest(manifestFile(t, text)); err == nil {
+			t.Errorf("explicit %s organization accepted", value)
+		}
+	}
+	setup(t)
+	path := filepath.Join(t.TempDir(), "pool.yaml")
+	a := New(nil, io.Discard, io.Discard, "test")
+	if exit := a.Run(context.Background(), []string{"init", "--project", testProject, "--organization", "not-a-uuid", "-f", path}); exit != 2 {
+		t.Fatal("malformed init organization accepted", exit)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("init wrote a manifest for malformed organization")
+	}
+	path = filepath.Join(t.TempDir(), "empty-org-pool.yaml")
+	if exit := a.Run(context.Background(), []string{"init", "--project", testProject, "--organization", "", "-f", path}); exit != 2 {
+		t.Fatal("explicit empty init organization accepted", exit)
 	}
 }
 

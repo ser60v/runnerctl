@@ -40,10 +40,10 @@ Global flags (before the command):
   --json           JSON output; watch emits NDJSON
 
 Commands:
-  auth login [--token-stdin] [--organization UUID --projects UUID,UUID]
+  auth login [--token-stdin]
              [--name NAME] [--scopes SCOPE,...] [--ttl 168h] [--email EMAIL]
   auth status | logout | tokens | revoke TOKEN_ID
-  init --organization UUID --project UUID [-f pool.yaml] [--concurrency 3]
+  init --project UUID [-f pool.yaml] [--concurrency 3]
        [--memory 8gb] [--disk 40.125gb]
   plan -f pool.yaml
   apply -f pool.yaml
@@ -233,7 +233,7 @@ func (c *client) identity(ctx context.Context) (cliContext, error) {
 
 func (a *App) initPool(args []string) error {
 	f := a.flags("init")
-	org := f.String("organization", "", "organization UUID")
+	org := f.String("organization", "", "optional organization UUID guard for existing workflows")
 	project := f.String("project", "", "project UUID")
 	file := f.String("f", "pool.yaml", "manifest destination")
 	name := f.String("name", "linux-ci", "pool name")
@@ -249,8 +249,16 @@ func (a *App) initPool(args []string) error {
 	if len(f.Args()) > 0 {
 		return usage("unexpected init arguments")
 	}
-	if err := validateUUID("organization", *org); err != nil {
-		return usage(err.Error())
+	orgProvided := false
+	f.Visit(func(option *flag.Flag) {
+		if option.Name == "organization" {
+			orgProvided = true
+		}
+	})
+	if orgProvided {
+		if err := validateUUID("organization", *org); err != nil {
+			return usage(err.Error())
+		}
 	}
 	if err := validateUUID("project", *project); err != nil {
 		return usage(err.Error())
@@ -328,7 +336,7 @@ func (a *App) manifestCommand(ctx context.Context, command string, args []string
 	if err != nil {
 		return err
 	}
-	if identity.Organization.ID != m.Metadata.OrganizationID {
+	if m.Metadata.OrganizationID != "" && identity.Organization.ID != m.Metadata.OrganizationID {
 		return errors.New("manifest organization does not match the authenticated token")
 	}
 	allowed := false

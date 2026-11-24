@@ -115,7 +115,7 @@ type manifest struct {
 	Context    string `yaml:"context"`
 	Metadata   struct {
 		ID             string `yaml:"id"`
-		OrganizationID string `yaml:"organization_id"`
+		OrganizationID string `yaml:"organization_id,omitempty"`
 		ProjectID      string `yaml:"project_id"`
 	} `yaml:"metadata"`
 	Spec poolSpec `yaml:"spec"`
@@ -158,8 +158,13 @@ func readManifest(path string) (manifest, error) {
 	if !contextName.MatchString(m.Context) {
 		return m, errors.New("manifest context must name an existing CLI context")
 	}
-	for key, value := range map[string]string{"metadata.id": m.Metadata.ID, "metadata.organization_id": m.Metadata.OrganizationID, "metadata.project_id": m.Metadata.ProjectID} {
+	for key, value := range map[string]string{"metadata.id": m.Metadata.ID, "metadata.project_id": m.Metadata.ProjectID} {
 		if err := validateUUID(key, value); err != nil {
+			return m, err
+		}
+	}
+	if yamlMappingValue(yamlMappingValue(&tree, "metadata"), "organization_id") != nil {
+		if err := validateUUID("metadata.organization_id", m.Metadata.OrganizationID); err != nil {
 			return m, err
 		}
 	}
@@ -172,6 +177,27 @@ func readManifest(path string) (manifest, error) {
 		return m, errors.New("spec requires name, environment, resources, max_runners, max_job_minutes and explicit enabled")
 	}
 	return m, nil
+}
+
+func yamlMappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode {
+		if len(node.Content) == 0 {
+			return nil
+		}
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 func validateYAML(n *yaml.Node) error {

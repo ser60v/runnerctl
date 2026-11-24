@@ -52,7 +52,7 @@ runnerctl projects list
 
 Login prompts for your account password and, when enabled, email two-factor
 codes, then lets you explicitly select accessible projects by number. You can
-also pass `--organization ORGANIZATION_UUID --projects PROJECT_UUID,PROJECT_UUID`.
+also pass `--projects PROJECT_UUID,PROJECT_UUID`. Your account supplies the organization.
 Issuance requires a fresh operation-bound confirmation. Passwords,
 session cookies and confirmation proofs stay in memory; the bootstrap session
 is logged out afterward. Only the issued PAT is saved in the current user's
@@ -90,14 +90,17 @@ explicitly supplied; a saved context or YAML cannot redirect it elsewhere.
 ## A pool as one YAML file
 
 ```sh
-runnerctl init --organization ORGANIZATION_UUID --project PROJECT_UUID \
-  --name linux-ci --concurrency 3 -f pool.yaml
+runnerctl sites list
+runnerctl init --project PROJECT_UUID \
+  --name linux-ci --concurrency 3 --site SITE_ID --disk 20gb -f pool.yaml
 runnerctl plan -f pool.yaml
 runnerctl apply -f pool.yaml
 ```
 
 `init` creates a unique pool ID once and refuses to overwrite a file. Keep that
-ID in version control so subsequent applies update the same pool. Example:
+ID in version control so subsequent applies update the same pool. For this
+20 GB example, choose a site with configurable disk from `sites list` and use
+its ID for `SITE_ID` and `site_id` below. Example:
 
 ```yaml
 apiVersion: runner.retardsoftware.com/v1
@@ -105,15 +108,14 @@ kind: Pool
 context: default
 metadata:
   id: 33333333-3333-4333-8333-333333333333
-  organization_id: 11111111-1111-4111-8111-111111111111
   project_id: 22222222-2222-4222-8222-222222222222
 spec:
   name: linux-ci
   environment: ubuntu-latest
-  site_id: ""
+  site_id: your-site
   cpu_millis: 2000
   memory: 8gb
-  disk: 40.125gb
+  disk: 20gb
   max_job_minutes: 60
   max_runners: 3
   enabled: true
@@ -122,13 +124,17 @@ spec:
 `runnerctl` 0.1.4 and later generate `runner.retardsoftware.com/v1`. Existing
 manifests using `runner.ser60v.com/v1` remain supported with the same behavior.
 
+`plan` and `apply` use the organization of your signed-in token and verify access
+to the selected project. No organization identifier is needed in the YAML.
+
 Resources are **per worker**, while `max_runners` is the pool concurrency cap.
-Three workers with these values need 6 CPUs, 24 GiB RAM and 123,264 MiB reserved
+Three workers with these values need 6 CPUs, 24 GB RAM and 60 GB reserved
 disk. Available organization/project budgets and eligible sites must fit those
 totals. Disk reservation includes site-specific execution overhead; it is not
 necessarily the writable workspace size. Inspect `sites list` and `plan`
-before lowering it. `init --cpu` accepts mCPU. `init --memory` and `--disk`
-accept sizes such as `8gb`, `40.125gb`, `40,125 GB`, and `512mb`. Surrounding
+before lowering it. For automatic placement, omit `--site` and `--disk` to
+keep the default disk profile. `init --cpu` accepts mCPU. `init --memory` and `--disk`
+accept sizes such as `8gb`, `20gb`, `1,5 GB`, and `512mb`. Surrounding
 spaces and a space before the unit are accepted. Decimal comma is accepted;
 grouping separators are not. Units are case insensitive:
 `mb`/`mib`, `gb`/`gib`, and `tb`/`tib` use binary multiples of MiB. A bare
@@ -137,7 +143,7 @@ fractional MiB, negative values, exponents, and overflow are rejected. Pool
 YAML uses `memory` and `disk`; existing `memory_mib` and `disk_mib` fields
 remain accepted as integers or unit strings. Supplying both names for one
 resource is rejected. API and `--json` resource fields remain integer MiB.
-For example, `40gb` is 40960 MiB and `40.125gb` is 41088 MiB;
+For example, `20gb` is 20480 MiB and `1.5gb` is 1536 MiB;
 the initial values above are a starting point, not a promise of capacity.
 Use `--site SITE_ID` from `sites list` and `--environment ENVIRONMENT_ID` from
 `environments list` to initialize an explicitly placed pool. Site identifiers

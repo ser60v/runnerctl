@@ -5,13 +5,44 @@ The CLI uses the same public API as the web application. A pool YAML holds
 desired configuration; a personal token holds access to explicitly selected
 projects in one organization.
 
+The [public client source](https://github.com/ser60v/runnerctl) contains the
+CLI, installers and packaging code. The platform API and backend are separate.
+The client has no analytics, telemetry or background upload. A command sends
+its required API request to the configured server, including the token for
+authenticated routes; the server can observe the request and connecting IP.
+The client is licensed under [MIT](LICENSE).
+
 ## Install and sign in
 
 [Public release metadata](https://runners.retardsoftware.com/downloads/runnerctl/latest/metadata.json)
-provides same-origin downloads of a standalone `runnerctl` binary for Linux and macOS
-(amd64/arm64), `VERSION`, and this README. Verify the archive against the release
-`SHA256SUMS`, extract it, and put the binary on your PATH. Windows users can use
-the Linux binary in WSL. Native Windows credential storage is not supported yet.
+provides versioned standalone archives for Linux, macOS and Windows on amd64 and
+arm64. For a current-user installation, use the matching installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsS https://runners.retardsoftware.com/downloads/runnerctl/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+```
+
+In Windows PowerShell:
+
+```powershell
+irm https://runners.retardsoftware.com/downloads/runnerctl/install.ps1 | iex
+```
+
+For a review before execution, download
+[`install.sh`](https://runners.retardsoftware.com/downloads/runnerctl/install.sh)
+or [`install.ps1`](https://runners.retardsoftware.com/downloads/runnerctl/install.ps1),
+read it, then run `sh install.sh` or `.\install.ps1`. PowerShell's usual script
+execution policy applies to a saved file; the one-line command does not require
+a global policy change. The installers select the platform archive, verify its
+SHA-256 digest against the versioned `SHA256SUMS`, inspect archive entries, and
+install into `~/.local/bin` or `%LOCALAPPDATA%\Programs\runnerctl`. The Unix
+one-liner updates the current shell's PATH; the installer prints the profile
+line to make it persistent. The Windows installer adds its directory to the
+current process and current user's Path without changing the machine Path.
+They do not use `sudo` or request elevation.
+You can also download and verify an archive manually using the metadata.
+Checksums and archives come from the same HTTPS origin; read
+[`SECURITY.md`](SECURITY.md) for the trust limits and reporting process.
 
 ```sh
 runnerctl auth login
@@ -24,9 +55,11 @@ codes, then lets you explicitly select accessible projects by number. You can
 also pass `--organization ORGANIZATION_UUID --projects PROJECT_UUID,PROJECT_UUID`.
 Issuance requires a fresh operation-bound confirmation. Passwords,
 session cookies and confirmation proofs stay in memory; the bootstrap session
-is logged out afterward. Only the issued PAT is saved, in a `0600` file inside
-the private `0700` directory `$XDG_CONFIG_HOME/runnerctl` (or the platform's
-user-config directory). Use a Unix filesystem that enforces these permissions.
+is logged out afterward. Only the issued PAT is saved in the current user's
+platform credential store. On Unix it is a `0600` file inside the private
+`0700` directory `$XDG_CONFIG_HOME/runnerctl` (or the platform's user-config
+directory). Use a Unix filesystem that enforces these permissions. On Windows
+it is protected by the current user's DPAPI profile.
 
 Tokens default to seven days and expire within thirty days. Use `--ttl 24h`,
 `--name build-agent`, and a narrower `--scopes` when appropriate. Available
@@ -217,7 +250,7 @@ quota implementation in this client.
 
 ## Development and release
 
-Requires Go 1.27.4 and Unix filesystem permissions. Public dependencies are
+Requires Go 1.27.4. Public dependencies are
 locked in `go.mod`/`go.sum`. Every Make entry point ensures a safe local `.env`;
 the CLI does not load shell commands or credentials from that file.
 
@@ -230,14 +263,21 @@ make down
 ```
 
 `make check` verifies dependencies, formatting, vet, unit/HTTP boundary tests,
-race tests and the production binary. Use `GOCACHE`, `GOMODCACHE`, `GOTMPDIR`
+race tests, Unix installer behavior and the production binary. Python 3 is needed
+for the installer tests. Use `GOCACHE`, `GOMODCACHE`, `GOTMPDIR`
 and `BUILD_DIR` to place build data on suitable storage. Tests require actual
 Unix permission semantics; Windows-mounted directories without metadata do not
 provide those semantics. `make smoke` checks the binary and Compose contract,
 including an inherited empty `SSH_AUTH_SOCK`.
 
-`VERSION` is the only release version. CI checks every branch and publishes
-checksummed Unix archives to the project's Generic Package Registry and a
+GitHub Actions runs the checks and cross-builds all six archives on the owner's
+Runner Platform Linux pool, selected by the `RUNNERCTL_RUNNER_LABEL` repository
+variable. Cross-building does not execute macOS or Windows tests; native tests
+can be run with `go test ./...` on those systems. Workflow tokens are read-only
+and checkout credentials are not persisted.
+
+`VERSION` is the only release version. GitLab release CI checks every branch and publishes
+checksummed Linux, macOS and Windows archives to the project's Generic Package Registry and a
 GitLab release when `VERSION` changes on the default branch. CI artifacts expire
 after seven days; released versions remain owned by Runner Platform maintainers
 until deliberately retired. Local `.runtime`/`.build` are disposable developer

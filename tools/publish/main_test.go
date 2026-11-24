@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,21 +25,55 @@ func testReleaseRoot(t *testing.T) string {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
+	var checksums strings.Builder
 	for _, name := range []string{
-		"SHA256SUMS",
 		"runnerctl_0.1.0_linux_amd64.tar.gz",
 		"runnerctl_0.1.0_linux_arm64.tar.gz",
 		"runnerctl_0.1.0_darwin_amd64.tar.gz",
 		"runnerctl_0.1.0_darwin_arm64.tar.gz",
+		"runnerctl_0.1.0_windows_amd64.zip",
+		"runnerctl_0.1.0_windows_arm64.zip",
+		"install.sh",
+		"install.ps1",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0600); err != nil {
 			t.Fatal(err)
 		}
+		fmt.Fprintf(&checksums, "%x  ./%s\n", sha256.Sum256([]byte(name)), name)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SHA256SUMS"), []byte(checksums.String()), 0600); err != nil {
+		t.Fatal(err)
 	}
 	t.Setenv("CI_PROJECT_ID", "42")
 	t.Setenv("CI_JOB_TOKEN", "test-job-token")
 	t.Setenv("CI_COMMIT_SHA", releaseCommit)
 	return root
+}
+
+func TestPublishRejectsModifiedAssetBeforeUpload(t *testing.T) {
+	root := testReleaseRoot(t)
+	if err := os.WriteFile(filepath.Join(root, ".build/release/install.sh"), []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	uploads := 0
+	srv := testReleaseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases/v0.1.0"):
+			http.NotFound(w, r)
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/repository/tags/v0.1.0"):
+			http.NotFound(w, r)
+		case r.Method == "PUT":
+			uploads++
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	if err := publishWithClient(srv.Client(), root); err == nil || !strings.Contains(err.Error(), "SHA256SUMS") {
+		t.Fatalf("expected checksum failure, got %v", err)
+	}
+	if uploads != 0 {
+		t.Fatalf("uploaded modified asset")
+	}
 }
 
 func testReleaseServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -124,7 +159,7 @@ func TestPublishVerifiesCreatedReleaseCommit(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "created release") {
 				t.Fatalf("expected created release mismatch, got %v", err)
 			}
-			if uploads != 5 || creates != 1 {
+			if uploads != 9 || creates != 1 {
 				t.Fatalf("unexpected publish calls: uploads=%d creates=%d", uploads, creates)
 			}
 		})
@@ -172,7 +207,7 @@ func TestPublishWithMatchingOrMissingTag(t *testing.T) {
 			if err := publishWithClient(srv.Client(), root); err != nil {
 				t.Fatal(err)
 			}
-			if uploads != 5 || creates != 1 {
+			if uploads != 9 || creates != 1 {
 				t.Fatalf("unexpected publish calls: uploads=%d creates=%d", uploads, creates)
 			}
 		})

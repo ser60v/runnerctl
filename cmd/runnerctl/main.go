@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/signal"
 
-	"git.ser60v.com/retardsoftware/runner-platform/cli/internal/cli"
+	"github.com/ser60v/runnerctl/internal/cli"
 )
 
 var version = "dev"

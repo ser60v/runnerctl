@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,7 +58,7 @@ func credentialPath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, name+".json"), nil
+	return filepath.Join(dir, name+credentialExtension), nil
 }
 
 func loadCredential(name string) (credential, error) {
@@ -65,37 +66,28 @@ func loadCredential(name string) (credential, error) {
 	if err != nil {
 		return credential{}, err
 	}
-	parent, err := os.Lstat(filepath.Dir(path))
+	data, err := readCredentialFile(path)
 	if err != nil {
 		return credential{}, err
 	}
-	if !parent.IsDir() || parent.Mode().Perm()&0077 != 0 {
-		return credential{}, errors.New("config directory must be private (0700)")
+	if len(data) > 8192 {
+		return credential{}, errors.New("credential file exceeds size limit")
 	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return credential{}, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return credential{}, errors.New("credential file must be a regular private file (0600)")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return credential{}, err
-	}
-	defer f.Close()
 	var c credential
-	dec := json.NewDecoder(io.LimitReader(f, 8193))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
-		return c, errors.New("invalid credential file")
+		return credential{}, errors.New("invalid credential file")
 	}
 	var extra any
 	if dec.Decode(&extra) != io.EOF || !tokenPattern.MatchString(c.Token) {
-		return c, errors.New("invalid credential file")
+		return credential{}, errors.New("invalid credential file")
 	}
 	c.Server, err = canonicalServer(c.Server)
-	return c, err
+	if err != nil {
+		return credential{}, err
+	}
+	return c, nil
 }
 
 func saveCredential(name string, c credential) error {
@@ -103,43 +95,18 @@ func saveCredential(name string, c credential) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+	if !tokenPattern.MatchString(c.Token) {
+		return errors.New("invalid personal token")
 	}
-	info, err := os.Lstat(dir)
+	c.Server, err = canonicalServer(c.Server)
 	if err != nil {
 		return err
-	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return errors.New("config directory must be private (0700)")
 	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, ".credential-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	if err := f.Chmod(0600); err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(f.Name(), path); err != nil {
-		return err
-	}
-	return nil
+	return writeCredentialFile(path, data)
 }
 
 func validateUUID(name, value string) error {

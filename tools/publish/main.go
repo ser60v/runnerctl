@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -101,13 +102,62 @@ func publishWithClient(client *http.Client, root string) error {
 	if err != nil {
 		return err
 	}
-	if len(files) != 5 {
-		return fmt.Errorf("expected four archives and SHA256SUMS")
+	if len(files) != 9 {
+		return fmt.Errorf("expected six archives, two installers and SHA256SUMS")
+	}
+	assets := make(map[string]string, 8)
+	for _, path := range files {
+		name := filepath.Base(path)
+		if name == "SHA256SUMS" {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("invalid release asset %s", name)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("cannot hash release asset %s", name)
+		}
+		assets[name] = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	checksumPath := filepath.Join(root, ".build/release/SHA256SUMS")
+	checksumInfo, err := os.Lstat(checksumPath)
+	if err != nil || !checksumInfo.Mode().IsRegular() || checksumInfo.Size() > 16384 {
+		return fmt.Errorf("invalid SHA256SUMS")
+	}
+	checksums, err := os.ReadFile(checksumPath)
+	if err != nil || len(checksums) > 16384 {
+		return fmt.Errorf("invalid SHA256SUMS")
+	}
+	lines := strings.Split(strings.TrimSuffix(string(checksums), "\n"), "\n")
+	if len(lines) != len(assets) {
+		return fmt.Errorf("SHA256SUMS must cover every release asset")
+	}
+	seen := make(map[string]bool, len(assets))
+	for _, line := range lines {
+		parts := strings.SplitN(line, "  ", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid SHA256SUMS entry")
+		}
+		name := strings.TrimPrefix(parts[1], "./")
+		if seen[name] || assets[name] == "" || parts[0] != assets[name] {
+			return fmt.Errorf("SHA256SUMS mismatch for %s", name)
+		}
+		seen[name] = true
 	}
 	links := []map[string]string{}
 	for _, path := range files {
 		name := filepath.Base(path)
-		if name != "SHA256SUMS" && !regexp.MustCompile(`^runnerctl_`+regexp.QuoteMeta(version)+`_(linux|darwin)_(amd64|arm64)\.tar\.gz$`).MatchString(name) {
+		unixArchive := regexp.MustCompile(`^runnerctl_` + regexp.QuoteMeta(version) + `_(linux|darwin)_(amd64|arm64)\.tar\.gz$`).MatchString(name)
+		windowsArchive := regexp.MustCompile(`^runnerctl_` + regexp.QuoteMeta(version) + `_windows_(amd64|arm64)\.zip$`).MatchString(name)
+		if name != "SHA256SUMS" && name != "install.sh" && name != "install.ps1" && !unixArchive && !windowsArchive {
 			return fmt.Errorf("unexpected release asset")
 		}
 		f, err := os.Open(path)

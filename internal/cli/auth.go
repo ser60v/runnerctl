@@ -70,7 +70,7 @@ func (a *App) auth(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err = removeCredentialFile(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		return a.output(map[string]any{"context": a.context, "local_credentials_removed": true, "token_revoked": false, "note": "The server token remains valid until revoked or expired; RUNNERCTL_TOKEN is unaffected."})

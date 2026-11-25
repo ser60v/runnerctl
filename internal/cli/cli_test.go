@@ -283,8 +283,8 @@ func TestNoRedirectCredentialLeakAndErrorRedaction(t *testing.T) {
 	}
 }
 
-func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
-	for _, action := range []string{"create", "update", "none", "conflict"} {
+func TestApplyUsesOptimisticPreconditionsIncludingNoop(t *testing.T) {
+	for _, action := range []string{"create", "update", "none", "conflict", "none_race"} {
 		t.Run(action, func(t *testing.T) {
 			setup(t)
 			writes := 0
@@ -293,9 +293,10 @@ func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
 					t.Error("missing token")
 				}
 				switch {
-				case strings.HasSuffix(r.URL.Path, "/cli/context"):
-					reply(w, identityResponse())
 				case strings.HasSuffix(r.URL.Path, "/plan"):
+					if r.Header.Get("X-Organization-ID") != testOrg {
+						t.Error("missing explicit organization guard")
+					}
 					revision := int64(4)
 					planAction := action
 					if action == "create" {
@@ -303,6 +304,9 @@ func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
 					}
 					if action == "conflict" {
 						planAction = "update"
+					}
+					if action == "none_race" {
+						planAction = "none"
 					}
 					reply(w, map[string]any{"pool_id": testPool, "revision": revision, "action": planAction, "errors": []any{}})
 				case r.Method == "PUT":
@@ -321,11 +325,15 @@ func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
 					if body["project_id"] != testProject || body["max_runners"] != float64(3) {
 						t.Error("wrong desired pool", body)
 					}
-					if action == "conflict" {
+					if action == "conflict" || action == "none_race" {
 						w.WriteHeader(412)
 						reply(w, map[string]any{"error": map[string]string{"code": "precondition_failed", "message": "changed"}})
 					} else {
-						reply(w, map[string]any{"id": testPool, "revision": 5})
+						revision := 5
+						if action == "none" {
+							revision = 4
+						}
+						reply(w, map[string]any{"id": testPool, "revision": revision})
 					}
 				default:
 					t.Error("unexpected request", r.Method, r.URL.Path)
@@ -342,18 +350,17 @@ func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
 			a := New(nil, &out, &errout, "test")
 			exit := a.Run(context.Background(), []string{"--json", "apply", "-f", path})
 			want := 0
-			if action == "conflict" {
+			if action == "conflict" || action == "none_race" {
 				want = 3
 			}
 			if exit != want {
 				t.Fatalf("exit=%d, %s", exit, errout.String())
 			}
-			wantWrites := 1
-			if action == "none" {
-				wantWrites = 0
-			}
-			if writes != wantWrites {
+			if writes != 1 {
 				t.Fatal("unexpected mutation count", writes)
+			}
+			if action == "none" && !bytes.Contains(out.Bytes(), []byte(`"revision":4`)) {
+				t.Fatal("no-op did not retain revision", out.String())
 			}
 			if strings.Contains(out.String()+errout.String(), testToken) {
 				t.Fatal("token leaked")
@@ -364,8 +371,18 @@ func TestApplyUsesOptimisticPreconditionsAndDoesNotRepeatNoop(t *testing.T) {
 
 func TestManifestCannotChangeOrganization(t *testing.T) {
 	setup(t)
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; reply(w, identityResponse()) }))
+	plans, writes := 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			writes++
+		}
+		if r.Method != "POST" || r.URL.Path != "/api/app/v1/pools/"+testPool+"/plan" || r.Header.Get("X-Organization-ID") != testPool {
+			t.Error("missing organization guard or unexpected request", r.Method, r.URL.Path)
+		}
+		plans++
+		w.WriteHeader(http.StatusForbidden)
+		reply(w, map[string]any{"error": map[string]string{"code": "permission_denied", "message": "organization mismatch"}})
+	}))
 	defer srv.Close()
 	_ = saveCredential("default", credential{srv.URL, testToken})
 	m := example()
@@ -378,8 +395,8 @@ func TestManifestCannotChangeOrganization(t *testing.T) {
 			t.Fatal("foreign org accepted by", command)
 		}
 	}
-	if calls != 2 {
-		t.Fatal("planned or wrote before organization verification")
+	if plans != 2 || writes != 0 {
+		t.Fatal("organization guard did not prevent apply", plans, writes)
 	}
 }
 
@@ -387,14 +404,14 @@ func TestManifestWithoutOrganizationUsesTokenProject(t *testing.T) {
 	for _, command := range []string{"plan", "apply"} {
 		t.Run(command, func(t *testing.T) {
 			setup(t)
-			identityCalls, planCalls, writes := 0, 0, 0
+			planCalls, writes := 0, 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
-				case r.Method == "GET" && r.URL.Path == "/api/app/v1/cli/context":
-					identityCalls++
-					reply(w, identityResponse())
 				case r.Method == "POST" && r.URL.Path == "/api/app/v1/pools/"+testPool+"/plan":
 					planCalls++
+					if r.Header.Get("X-Organization-ID") != "" || r.Header.Get("Authorization") != "Bearer "+testToken {
+						t.Error("unexpected token or organization guard")
+					}
 					var body map[string]any
 					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 						t.Error(err)
@@ -415,9 +432,7 @@ func TestManifestWithoutOrganizationUsesTokenProject(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
-				t.Fatal(err)
-			}
+			t.Setenv("RUNNERCTL_TOKEN", testToken)
 			m := example()
 			m.Metadata.OrganizationID = ""
 			b, err := yaml.Marshal(m)
@@ -429,15 +444,15 @@ func TestManifestWithoutOrganizationUsesTokenProject(t *testing.T) {
 			}
 			var stderr bytes.Buffer
 			a := New(nil, io.Discard, &stderr, "test")
-			if exit := a.Run(context.Background(), []string{command, "-f", manifestFile(t, string(b))}); exit != 0 {
+			if exit := a.Run(context.Background(), []string{"--server", srv.URL, command, "-f", manifestFile(t, string(b))}); exit != 0 {
 				t.Fatalf("%s failed: exit %d: %s", command, exit, stderr.String())
 			}
 			wantWrites := 0
 			if command == "apply" {
 				wantWrites = 1
 			}
-			if identityCalls != 1 || planCalls != 1 || writes != wantWrites {
-				t.Fatalf("identity=%d plan=%d writes=%d", identityCalls, planCalls, writes)
+			if planCalls != 1 || writes != wantWrites {
+				t.Fatalf("plan=%d writes=%d", planCalls, writes)
 			}
 		})
 	}
@@ -448,12 +463,11 @@ func TestManifestWithoutOrganizationRejectsInaccessibleProject(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.URL.Path != "/api/app/v1/cli/context" {
-			t.Error("request after inaccessible project", r.Method, r.URL.Path)
+		if r.Method != "POST" || r.URL.Path != "/api/app/v1/pools/"+testPool+"/plan" {
+			t.Error("unexpected request", r.Method, r.URL.Path)
 		}
-		identity := identityResponse().(map[string]any)
-		identity["projects"] = []any{}
-		reply(w, identity)
+		w.WriteHeader(http.StatusNotFound)
+		reply(w, map[string]any{"error": map[string]string{"code": "not_found", "message": "project unavailable"}})
 	}))
 	defer srv.Close()
 	if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
@@ -470,7 +484,80 @@ func TestManifestWithoutOrganizationRejectsInaccessibleProject(t *testing.T) {
 		}
 	}
 	if calls != 2 {
-		t.Fatal("expected only identity requests, got", calls)
+		t.Fatal("expected only server-rejected plans, got", calls)
+	}
+}
+
+func TestListFlagsMatchSupportedAPIQueries(t *testing.T) {
+	setup(t)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		switch r.URL.Path {
+		case "/api/app/v1/pools":
+			if r.URL.Query().Get("limit") != "1" || r.URL.Query().Get("offset") != "1" || r.URL.Query().Get("project_id") != testProject {
+				t.Error("pool pagination was not forwarded", r.URL)
+			}
+		case "/api/app/v1/projects":
+			if r.URL.RawQuery != "" {
+				t.Error("catalog list received unsupported query", r.URL)
+			}
+		default:
+			t.Error("unexpected request", r.URL)
+		}
+		reply(w, map[string]any{"items": []any{}, "total": 0})
+	}))
+	defer srv.Close()
+	if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"pools", "list", "--project", testProject, "--limit", "1", "--offset", "1"}, {"projects", "list"}} {
+		if exit := New(nil, io.Discard, io.Discard, "test").Run(context.Background(), args); exit != 0 {
+			t.Fatal("supported list failed", args, exit)
+		}
+	}
+	for _, args := range [][]string{
+		{"pools", "list", "--status", "running"},
+		{"projects", "list", "--limit", "1"},
+		{"projects", "list", "--project", testProject},
+		{"environments", "list", "--offset", "1"},
+		{"sites", "list", "--status", "running"},
+	} {
+		if exit := New(nil, io.Discard, io.Discard, "test").Run(context.Background(), args); exit != 2 {
+			t.Error("unsupported list flag was accepted", args, exit)
+		}
+	}
+	if calls != 2 {
+		t.Fatal("unsupported list flags reached the server", calls)
+	}
+}
+
+func TestWorkflowJobsPagination(t *testing.T) {
+	setup(t)
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != "GET" || r.URL.Path != "/api/app/v1/workflow-runs/"+testPool+"/jobs" || r.URL.Query().Get("limit") != "50" || r.URL.Query().Get("offset") != "50" {
+			t.Error("workflow jobs page was not forwarded", r.URL)
+		}
+		reply(w, map[string]any{"items": []any{map[string]string{"id": testProject}}, "total": 51, "limit": 50, "offset": 50})
+	}))
+	defer srv.Close()
+	if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if exit := New(nil, &out, io.Discard, "test").Run(context.Background(), []string{"--json", "workflows", "jobs", testPool, "--limit", "50", "--offset", "50"}); exit != 0 || !bytes.Contains(out.Bytes(), []byte(testProject)) {
+		t.Fatal("second workflow jobs page unavailable", exit, out.String())
+	}
+	for _, args := range [][]string{{"--limit", "101"}, {"--offset", "1000001"}, {"--limit", "0"}, {"unexpected"}} {
+		command := append([]string{"workflows", "jobs", testPool}, args...)
+		if exit := New(nil, io.Discard, io.Discard, "test").Run(context.Background(), command); exit != 2 {
+			t.Error("invalid workflow jobs pagination accepted", command, exit)
+		}
+	}
+	if calls != 1 {
+		t.Fatal("invalid workflow jobs flags reached the server", calls)
 	}
 }
 

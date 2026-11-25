@@ -47,14 +47,16 @@ Commands:
        [--memory 8gb] [--disk 40.125gb]
   plan -f pool.yaml
   apply -f pool.yaml
-  pools list [--project UUID] | get UUID | delete UUID
+  pools list [--project UUID] [--limit 50] [--offset 0]
+  pools get UUID | delete UUID
   runs list [--project UUID] [--status STATUS] [--limit 50] [--offset 0]
   runs get UUID | cancel UUID
   runs watch UUID [--interval 5s] [--timeout 15m]
   runners list [--all] [--project UUID] [--pool UUID] [--status STATUS]
                [--limit 50] [--offset 0]
   runners get UUID | watch UUID [--interval 5s] [--timeout 15m]
-  workflows list [--project UUID] | jobs UUID
+  workflows list [--project UUID] [--status STATUS] [--limit 50] [--offset 0]
+  workflows jobs UUID [--limit 50] [--offset 0]
   projects list | environments list | sites list | status | version
   status watch [--interval 5s] [--timeout 15m]
   schema          offline JSON command contract (also: --json help)
@@ -332,22 +334,9 @@ func (a *App) manifestCommand(ctx context.Context, command string, args []string
 	if err != nil {
 		return err
 	}
-	identity, err := c.identity(ctx)
-	if err != nil {
-		return err
-	}
-	if m.Metadata.OrganizationID != "" && identity.Organization.ID != m.Metadata.OrganizationID {
-		return errors.New("manifest organization does not match the authenticated token")
-	}
-	allowed := false
-	for _, p := range identity.Projects {
-		if p.ID == m.Metadata.ProjectID {
-			allowed = true
-		}
-	}
-	if !allowed {
-		return errors.New("manifest project is not accessible with this token")
-	}
+	// An explicit organization in an older manifest is an additional gateway
+	// guard. The API authoritatively checks the token's current project access.
+	c.organization = m.Metadata.OrganizationID
 	path := "/api/app/v1/pools/" + m.Metadata.ID
 	res, err := c.request(ctx, "POST", path+"/plan", m.body(), nil)
 	if err != nil {
@@ -362,9 +351,6 @@ func (a *App) manifestCommand(ctx context.Context, command string, args []string
 	}
 	if command == "plan" {
 		return a.output(res.Body)
-	}
-	if p.Action == "none" {
-		return a.output(map[string]any{"action": "none", "pool_id": p.PoolID, "revision": p.Revision})
 	}
 	headers := http.Header{}
 	if p.Action == "create" {
@@ -382,6 +368,9 @@ func (a *App) manifestCommand(ctx context.Context, command string, args []string
 	res, err = c.request(ctx, "PUT", path, m.body(), headers)
 	if err != nil {
 		return err
+	}
+	if p.Action == "none" {
+		return a.output(map[string]any{"action": "none", "pool_id": p.PoolID, "revision": p.Revision})
 	}
 	var pool any
 	if err = json.Unmarshal(res.Body, &pool); err != nil {
@@ -416,12 +405,17 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 	switch sub {
 	case "list":
 		f := a.flags(resource + " list")
-		project := f.String("project", "", "project UUID")
-		status := f.String("status", "", "status")
-		limit := f.Int("limit", 50, "page size")
-		offset := f.Int("offset", 0, "page offset")
-		var pool string
+		var project, status, pool string
+		limit, offset := 50, 0
 		var all bool
+		if resource != "projects" && resource != "environments" && resource != "sites" {
+			f.StringVar(&project, "project", "", "project UUID")
+			f.IntVar(&limit, "limit", 50, "page size")
+			f.IntVar(&offset, "offset", 0, "page offset")
+		}
+		if resource == "runs" || resource == "runners" || resource == "workflows" {
+			f.StringVar(&status, "status", "", "status")
+		}
 		if resource == "runners" {
 			f.StringVar(&pool, "pool", "", "pool UUID")
 			f.BoolVar(&all, "all", false, "include completed allocations")
@@ -441,27 +435,34 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 				}
 				q.Set("pool_id", pool)
 			}
-			if *status != "" && !runnerStatus(*status) {
+			if status != "" && !runnerStatus(status) {
 				return usage("unknown runner status")
 			}
 		}
-		if *project != "" {
-			if err := validateUUID("project", *project); err != nil {
+		if project != "" {
+			if err := validateUUID("project", project); err != nil {
 				return usage(err.Error())
 			}
-			q.Set("project_id", *project)
+			q.Set("project_id", project)
 		}
-		if *status != "" {
-			q.Set("status", *status)
+		if status != "" {
+			q.Set("status", status)
 		}
-		if *limit < 1 || *limit > 100 || *offset < 0 || *offset > 1000000 {
-			return usage("invalid pagination")
+		if resource != "projects" && resource != "environments" && resource != "sites" {
+			if limit < 1 || limit > 100 || offset < 0 || offset > 1000000 {
+				return usage("invalid pagination")
+			}
+			q.Set("limit", strconv.Itoa(limit))
+			q.Set("offset", strconv.Itoa(offset))
 		}
-		q.Set("limit", strconv.Itoa(*limit))
-		q.Set("offset", strconv.Itoa(*offset))
-		path += "?" + q.Encode()
+		if len(q) > 0 {
+			path += "?" + q.Encode()
+		}
 	case "get", "delete", "cancel", "jobs":
-		if len(args) != 1 {
+		if len(args) == 0 {
+			return usage(sub + " requires one UUID")
+		}
+		if sub != "jobs" && len(args) != 1 {
 			return usage(sub + " requires one UUID")
 		}
 		if err := validateUUID("id", args[0]); err != nil {
@@ -473,6 +474,17 @@ func (a *App) resource(ctx context.Context, resource string, args []string) erro
 		path += "/" + args[0]
 		if sub == "jobs" {
 			path += "/jobs"
+			f := a.flags("workflows jobs")
+			limit := f.Int("limit", 50, "page size")
+			offset := f.Int("offset", 0, "page offset")
+			if err := f.Parse(args[1:]); err != nil {
+				return usage(err.Error())
+			}
+			if len(f.Args()) > 0 || *limit < 1 || *limit > 100 || *offset < 0 || *offset > 1000000 {
+				return usage("invalid workflow jobs pagination")
+			}
+			q := url.Values{"limit": {strconv.Itoa(*limit)}, "offset": {strconv.Itoa(*offset)}}
+			path += "?" + q.Encode()
 		}
 		if sub == "cancel" {
 			path += "/cancel"

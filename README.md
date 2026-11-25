@@ -64,7 +64,9 @@ it is protected by the current user's DPAPI profile.
 Tokens default to seven days and expire within thirty days. Use `--ttl 24h`,
 `--name build-agent`, and a narrower `--scopes` when appropriate. Available
 scopes are `catalog.read`, `pools.read`, `pools.write`, `runs.read`, and
-`runs.cancel`. The CLI requires `catalog.read` for identity/project discovery.
+`runs.cancel`. `auth status` and token import require `catalog.read` for
+identity verification; interactive login also uses it for project discovery.
+Pool `plan` and `apply` require `pools.write` and let the server check project access.
 An observer can use `--scopes catalog.read,pools.read,runs.read`. The server
 rechecks current account status, membership, project access and token revocation
 on requests. A token cannot grant permissions its owner no longer has.
@@ -124,8 +126,10 @@ spec:
 `runnerctl` 0.1.4 and later generate `runner.retardsoftware.com/v1`. Existing
 manifests using `runner.ser60v.com/v1` remain supported with the same behavior.
 
-`plan` and `apply` use the organization of your signed-in token and verify access
-to the selected project. No organization identifier is needed in the YAML.
+`plan` and `apply` use the organization of your signed-in token. The server
+verifies current access to the selected project. No organization identifier is
+needed in the YAML. An explicit `organization_id` in an older manifest remains
+an additional request guard.
 
 Resources are **per worker**, while `max_runners` is the pool concurrency cap.
 Three workers with these values need 6 CPUs, 24 GB RAM and 60 GB reserved
@@ -154,7 +158,9 @@ server without reserving resources. It returns the current revision, changes
 and validation errors. `apply` obtains a fresh plan and uses `If-Match` for an
 update or `If-None-Match: *` for creation. A concurrent UI/CLI change returns a
 conflict instead of being overwritten; inspect a new plan and retry. Reapplying
-an unchanged configuration performs no write. A pool cannot move projects.
+an unchanged configuration leaves pool state and revision unchanged; the CLI
+still sends a conditional request so a concurrent change is detected. A pool
+cannot move projects.
 The YAML has no hooks, interpolation, credentials or remote includes. Unknown
 fields, duplicate keys, aliases and extra documents are rejected.
 
@@ -166,7 +172,7 @@ The manifest must match the selected context and cannot switch credentials.
 ## Inspect and operate
 
 ```sh
-runnerctl pools list --project PROJECT_UUID
+runnerctl pools list --project PROJECT_UUID --limit 50 --offset 0
 runnerctl pools get POOL_UUID
 runnerctl pools delete POOL_UUID
 runnerctl environments list
@@ -174,7 +180,7 @@ runnerctl sites list
 runnerctl status
 runnerctl status watch --interval 5s --timeout 15m
 runnerctl workflows list --project PROJECT_UUID
-runnerctl workflows jobs WORKFLOW_GROUP_UUID
+runnerctl workflows jobs WORKFLOW_GROUP_UUID --limit 50 --offset 50
 runnerctl runs list --project PROJECT_UUID --status running --limit 50 --offset 0
 runnerctl runs get JOB_UUID
 runnerctl runs watch JOB_UUID --timeout 15m --interval 5s

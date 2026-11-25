@@ -141,6 +141,89 @@ func TestInitEmitsCurrentPoolSchema(t *testing.T) {
 	if m.APIVersion != "runner.retardsoftware.com/v1" || m.Metadata.OrganizationID != "" || m.Metadata.ProjectID != testProject {
 		t.Fatal("init did not emit the current schema and requested scope")
 	}
+	var body map[string]any
+	if err := json.Unmarshal(m.body(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"cpu_millis", "memory_mib", "disk_mib", "max_job_minutes"} {
+		if _, exists := body[field]; exists {
+			t.Errorf("ordinary init overrides server-assigned %s", field)
+		}
+	}
+	if body["max_runners"] != float64(3) {
+		t.Fatal("init lost the requested parallelism")
+	}
+}
+
+func TestOptionalManifestResourcesRejectExplicitInvalidValues(t *testing.T) {
+	m := example()
+	m.Spec.CPU, m.Spec.Memory, m.Spec.Disk, m.Spec.MaxJobMinutes = 0, 0, 0, 0
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readManifest(manifestFile(t, string(data))); err != nil {
+		t.Fatalf("omitted resources rejected: %v", err)
+	}
+	for _, field := range []string{"cpu_millis", "memory", "memory_mib", "disk", "disk_mib", "max_job_minutes"} {
+		for _, value := range []string{"0", "null", "-1"} {
+			text := strings.Replace(string(data), "spec:\n", "spec:\n    "+field+": "+value+"\n", 1)
+			if _, err := readManifest(manifestFile(t, text)); err == nil {
+				t.Errorf("explicit %s: %s treated as omitted", field, value)
+			}
+		}
+	}
+}
+
+func TestApplyParallelismDoesNotCopyResourceDefaultsFromPlan(t *testing.T) {
+	setup(t)
+	m := example()
+	m.Spec.CPU, m.Spec.Memory, m.Spec.Disk, m.Spec.MaxJobMinutes = 0, 0, 0, 0
+	m.Spec.MaxRunners = 4
+	plans, writes := 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		for _, field := range []string{"cpu_millis", "memory_mib", "disk_mib", "max_job_minutes"} {
+			if _, exists := body[field]; exists {
+				t.Errorf("%s overwrote operator-assigned %s", r.Method, field)
+			}
+		}
+		if body["max_runners"] != float64(4) {
+			t.Error("lost desired parallelism")
+		}
+		switch {
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/plan"):
+			plans++
+			reply(w, map[string]any{"pool_id": testPool, "revision": 7, "action": "update", "desired": map[string]any{"cpu_millis": 3250, "memory_mib": 10496, "disk_mib": 81920, "max_job_minutes": 90}, "errors": []any{}})
+		case r.Method == "PUT" && r.URL.Path == "/api/app/v1/pools/"+testPool:
+			writes++
+			if r.Header.Get("If-Match") != `"7"` {
+				t.Error("lost revision guard")
+			}
+			reply(w, map[string]any{"id": testPool, "revision": 8, "disk_mib": 81920, "max_runners": 4})
+		default:
+			t.Error("unexpected request", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	if err := saveCredential("default", credential{srv.URL, testToken}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if exit := New(nil, io.Discard, &stderr, "test").Run(context.Background(), []string{"apply", "-f", manifestFile(t, string(data))}); exit != 0 {
+		t.Fatalf("apply: %d, %s", exit, stderr.String())
+	}
+	if plans != 1 || writes != 1 {
+		t.Fatalf("plan/apply counts: %d/%d", plans, writes)
+	}
 }
 
 func TestSizeConversionIsExact(t *testing.T) {

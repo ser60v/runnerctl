@@ -44,7 +44,6 @@ Commands:
              [--name NAME] [--scopes SCOPE,...] [--ttl 168h] [--email EMAIL]
   auth status | logout | tokens | revoke TOKEN_ID
   init --project UUID [-f pool.yaml] [--concurrency 3]
-       [--memory 8gb] [--disk 40.125gb]
   plan -f pool.yaml
   apply -f pool.yaml
   pools list [--project UUID] [--limit 50] [--offset 0]
@@ -242,22 +241,20 @@ func (a *App) initPool(args []string) error {
 	site := f.String("site", "", "site identifier (empty: automatic placement)")
 	environment := f.String("environment", "ubuntu-latest", "runner environment")
 	concurrency := f.Int("concurrency", 3, "parallel jobs")
-	cpu := f.Int("cpu", 2000, "mCPU per job")
-	memory := f.String("memory", "8gb", "memory per job (e.g. 8gb; bare integer is MiB)")
-	disk := f.String("disk", "40.125gb", "disk reserved per job (e.g. 40gb; bare integer is MiB)")
+	cpu := f.Int("cpu", 0, "operator override: reserved mCPU per job")
+	memory := f.String("memory", "", "operator override: memory reservation (e.g. 10gb; bare integer is MiB)")
+	disk := f.String("disk", "", "operator override: disk reservation (e.g. 40gb; bare integer is MiB)")
 	if err := f.Parse(args); err != nil {
 		return usage(err.Error())
 	}
 	if len(f.Args()) > 0 {
 		return usage("unexpected init arguments")
 	}
-	orgProvided := false
+	provided := map[string]bool{}
 	f.Visit(func(option *flag.Flag) {
-		if option.Name == "organization" {
-			orgProvided = true
-		}
+		provided[option.Name] = true
 	})
-	if orgProvided {
+	if provided["organization"] {
 		if err := validateUUID("organization", *org); err != nil {
 			return usage(err.Error())
 		}
@@ -265,22 +262,28 @@ func (a *App) initPool(args []string) error {
 	if err := validateUUID("project", *project); err != nil {
 		return usage(err.Error())
 	}
-	memoryMiB, err := parseSize(*memory)
-	if err != nil {
-		return usage("invalid --memory: " + err.Error())
+	var memoryMiB, diskMiB int
+	var err error
+	if provided["memory"] {
+		memoryMiB, err = parseSize(*memory)
+		if err != nil {
+			return usage("invalid --memory: " + err.Error())
+		}
 	}
-	diskMiB, err := parseSize(*disk)
-	if err != nil {
-		return usage("invalid --disk: " + err.Error())
+	if provided["disk"] {
+		diskMiB, err = parseSize(*disk)
+		if err != nil {
+			return usage("invalid --disk: " + err.Error())
+		}
 	}
-	if *concurrency < 1 || *concurrency > 1000 || *cpu < 500 || memoryMiB < 512 || diskMiB < 512 {
+	if *concurrency < 1 || *concurrency > 1000 || provided["cpu"] && (*cpu < 500 || *cpu > 128000) || provided["memory"] && (memoryMiB < 512 || memoryMiB > 1048576) || provided["disk"] && (diskMiB < 512 || diskMiB > 10485760) {
 		return usage("invalid resource values")
 	}
 	if *site != "" && !sitePattern.MatchString(*site) {
 		return usage("invalid site identifier")
 	}
 	enabled := true
-	m := manifest{APIVersion: poolAPIVersion, Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: memoryMiB, Disk: diskMiB, MaxJobMinutes: 60, MaxRunners: *concurrency, Enabled: &enabled}}
+	m := manifest{APIVersion: poolAPIVersion, Kind: "Pool", Context: a.context, Spec: poolSpec{Name: *name, Environment: *environment, SiteID: *site, CPU: *cpu, Memory: memoryMiB, Disk: diskMiB, MaxRunners: *concurrency, Enabled: &enabled}}
 	m.Metadata.ID = newUUID()
 	m.Metadata.OrganizationID = *org
 	m.Metadata.ProjectID = *project

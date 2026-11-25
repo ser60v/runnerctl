@@ -18,10 +18,10 @@ type poolSpec struct {
 	Name          string `json:"name" yaml:"name"`
 	Environment   string `json:"environment" yaml:"environment"`
 	SiteID        string `json:"site_id" yaml:"site_id"`
-	CPU           int    `json:"cpu_millis" yaml:"cpu_millis"`
-	Memory        int    `json:"memory_mib" yaml:"-"`
-	Disk          int    `json:"disk_mib" yaml:"-"`
-	MaxJobMinutes int    `json:"max_job_minutes" yaml:"max_job_minutes"`
+	CPU           int    `json:"cpu_millis,omitempty" yaml:"cpu_millis,omitempty"`
+	Memory        int    `json:"memory_mib,omitempty" yaml:"-"`
+	Disk          int    `json:"disk_mib,omitempty" yaml:"-"`
+	MaxJobMinutes int    `json:"max_job_minutes,omitempty" yaml:"max_job_minutes,omitempty"`
 	MaxRunners    int    `json:"max_runners" yaml:"max_runners"`
 	Enabled       *bool  `json:"enabled" yaml:"enabled"`
 }
@@ -30,16 +30,23 @@ type poolSpecYAML struct {
 	Name          string `yaml:"name"`
 	Environment   string `yaml:"environment"`
 	SiteID        string `yaml:"site_id"`
-	CPU           int    `yaml:"cpu_millis"`
-	Memory        string `yaml:"memory"`
-	Disk          string `yaml:"disk"`
-	MaxJobMinutes int    `yaml:"max_job_minutes"`
+	CPU           int    `yaml:"cpu_millis,omitempty"`
+	Memory        string `yaml:"memory,omitempty"`
+	Disk          string `yaml:"disk,omitempty"`
+	MaxJobMinutes int    `yaml:"max_job_minutes,omitempty"`
 	MaxRunners    int    `yaml:"max_runners"`
 	Enabled       *bool  `yaml:"enabled"`
 }
 
 func (s poolSpec) MarshalYAML() (any, error) {
-	return poolSpecYAML{s.Name, s.Environment, s.SiteID, s.CPU, formatSize(s.Memory), formatSize(s.Disk), s.MaxJobMinutes, s.MaxRunners, s.Enabled}, nil
+	out := poolSpecYAML{Name: s.Name, Environment: s.Environment, SiteID: s.SiteID, CPU: s.CPU, MaxJobMinutes: s.MaxJobMinutes, MaxRunners: s.MaxRunners, Enabled: s.Enabled}
+	if s.Memory != 0 {
+		out.Memory = formatSize(s.Memory)
+	}
+	if s.Disk != 0 {
+		out.Disk = formatSize(s.Disk)
+	}
+	return out, nil
 }
 
 func (s *poolSpec) UnmarshalYAML(node *yaml.Node) error {
@@ -80,11 +87,33 @@ func (s *poolSpec) UnmarshalYAML(node *yaml.Node) error {
 	}
 	*s = poolSpec{Name: raw.Name, Environment: raw.Environment, SiteID: raw.SiteID, CPU: raw.CPU, MaxJobMinutes: raw.MaxJobMinutes, MaxRunners: raw.MaxRunners, Enabled: raw.Enabled}
 	var err error
-	if s.Memory, err = sizeFromYAML(memoryNode); err != nil {
-		return fmt.Errorf("spec.memory: %w", err)
+	if memoryNode != nil {
+		if s.Memory, err = sizeFromYAML(memoryNode); err != nil {
+			return fmt.Errorf("spec.memory: %w", err)
+		}
 	}
-	if s.Disk, err = sizeFromYAML(diskNode); err != nil {
-		return fmt.Errorf("spec.disk: %w", err)
+	if diskNode != nil {
+		if s.Disk, err = sizeFromYAML(diskNode); err != nil {
+			return fmt.Errorf("spec.disk: %w", err)
+		}
+	}
+	for _, resource := range []struct {
+		name    string
+		value   int
+		minimum int
+		maximum int
+	}{
+		{"cpu_millis", s.CPU, 500, 128000},
+		{"max_job_minutes", s.MaxJobMinutes, 1, 1440},
+	} {
+		if value := yamlMappingValue(node, resource.name); value != nil {
+			if value.Tag != "!!int" || resource.value < resource.minimum || resource.value > resource.maximum {
+				return fmt.Errorf("spec.%s is outside supported bounds", resource.name)
+			}
+		}
+	}
+	if memoryNode != nil && (s.Memory < 512 || s.Memory > 1048576) || diskNode != nil && (s.Disk < 512 || s.Disk > 10485760) {
+		return errors.New("spec memory or disk is outside supported bounds")
 	}
 	return nil
 }
@@ -173,8 +202,8 @@ func readManifest(path string) (manifest, error) {
 			return m, errors.New("spec.site_id must be a site identifier from sites list")
 		}
 	}
-	if m.Spec.Enabled == nil || m.Spec.Name == "" || m.Spec.Environment == "" || m.Spec.CPU < 500 || m.Spec.Memory < 512 || m.Spec.Disk < 512 || m.Spec.MaxRunners < 1 || m.Spec.MaxJobMinutes < 1 {
-		return m, errors.New("spec requires name, environment, resources, max_runners, max_job_minutes and explicit enabled")
+	if m.Spec.Enabled == nil || m.Spec.Name == "" || m.Spec.Environment == "" || m.Spec.MaxRunners < 1 || m.Spec.MaxRunners > 1000 {
+		return m, errors.New("spec requires name, environment, max_runners (1-1000) and explicit enabled")
 	}
 	return m, nil
 }

@@ -94,15 +94,14 @@ explicitly supplied; a saved context or YAML cannot redirect it elsewhere.
 ```sh
 runnerctl sites list
 runnerctl init --project PROJECT_UUID \
-  --name linux-ci --concurrency 3 --site SITE_ID --disk 20gb -f pool.yaml
+  --name linux-ci --concurrency 3 -f pool.yaml
 runnerctl plan -f pool.yaml
 runnerctl apply -f pool.yaml
 ```
 
 `init` creates a unique pool ID once and refuses to overwrite a file. Keep that
-ID in version control so subsequent applies update the same pool. For this
-20 GB example, choose a site with configurable disk from `sites list` and use
-its ID for `SITE_ID` and `site_id` below. Example:
+ID in version control so subsequent applies update the same pool. Choose the
+number of concurrent workers; the API supplies their assigned resources. Example:
 
 ```yaml
 apiVersion: runner.retardsoftware.com/v1
@@ -114,11 +113,7 @@ metadata:
 spec:
   name: linux-ci
   environment: ubuntu-latest
-  site_id: your-site
-  cpu_millis: 2000
-  memory: 8gb
-  disk: 20gb
-  max_job_minutes: 60
+  site_id: ""
   max_runners: 3
   enabled: true
 ```
@@ -131,24 +126,26 @@ verifies current access to the selected project. No organization identifier is
 needed in the YAML. An explicit `organization_id` in an older manifest remains
 an additional request guard.
 
-Resources are **per worker**, while `max_runners` is the pool concurrency cap.
-Three workers with these values need 6 CPUs, 24 GB RAM and 60 GB reserved
-disk. Available organization/project budgets and eligible sites must fit those
-totals. Disk reservation includes site-specific execution overhead; it is not
-necessarily the writable workspace size. Inspect `sites list` and `plan`
-before lowering it. For automatic placement, omit `--site` and `--disk` to
-keep the default disk profile. `init --cpu` accepts mCPU. `init --memory` and `--disk`
-accept sizes such as `8gb`, `20gb`, `1,5 GB`, and `512mb`. Surrounding
-spaces and a space before the unit are accepted. Decimal comma is accepted;
-grouping separators are not. Units are case insensitive:
-`mb`/`mib`, `gb`/`gib`, and `tb`/`tib` use binary multiples of MiB. A bare
-integer is MiB for compatibility. Values must resolve to a positive whole MiB;
-fractional MiB, negative values, exponents, and overflow are rejected. Pool
-YAML uses `memory` and `disk`; existing `memory_mib` and `disk_mib` fields
-remain accepted as integers or unit strings. Supplying both names for one
-resource is rejected. API and `--json` resource fields remain integer MiB.
-For example, `20gb` is 20480 MiB and `1.5gb` is 1536 MiB;
-the initial values above are a starting point, not a promise of capacity.
+`max_runners` is the pool concurrency cap. Increasing it does not shrink each
+worker's resources. The organization's worker limit is shared across its pools
+and projects; project limits may further restrict concurrency. CPU, memory and
+disk are checked against physical site capacity, not aggregate organization
+resource budgets. `plan` checks the same policy as the website.
+Omitted CPU, memory, disk and job-duration limits use server defaults on create
+and preserve the pool's assigned values on update. If a pool needs more disk or
+other custom resources, ask the platform operator to adjust that pool. Subsequent
+applies of this manifest preserve those adjustments.
+
+Older manifests with explicit resource values remain readable. The API permits
+unchanged values but restricts resource changes to platform operators; remove
+those fields from a customer manifest to follow the assigned profile. Operator
+overrides `--cpu`, `--memory` and `--disk` remain available. CPU is reserved mCPU;
+memory/disk are reservations including runtime overhead, not necessarily guest
+resources or writable workspace. Sizes accept `mb`/`mib`, `gb`/`gib`, `tb`/`tib`
+as binary multiples of MiB, or integer MiB. Decimal comma is accepted, grouping
+separators are not; values must resolve to positive whole MiB. YAML supports
+`memory`/`disk` and legacy `memory_mib`/`disk_mib`, but rejects both names for the
+same resource. API JSON remains integer MiB.
 Use `--site SITE_ID` from `sites list` and `--environment ENVIRONMENT_ID` from
 `environments list` to initialize an explicitly placed pool. Site identifiers
 are names such as `desktop-wsl-i9`, not project UUIDs.
